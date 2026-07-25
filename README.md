@@ -43,6 +43,7 @@ Citrus/
 ├── media/
 ├── logs/
 ├── configs/
+├── core/
 ├── backups/
 ├── scripts/
 └── temp/
@@ -60,4 +61,4 @@ Every new feature will be documented as the project evolves.
 
 ---
 
-**Project Started:** July 2026 🍋
+**Project Started:** 24 July 2026 🍋

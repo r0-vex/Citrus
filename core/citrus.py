@@ -1,27 +1,10 @@
-import os
+from menu import main_loop
 
-def clear():
-    os.system("clear")
 
-while True:
-    clear()
+def main() -> None:
+    """Start the Citrus application."""
+    main_loop()
 
-    print("=" * 50)
-    print("              🍋 CITRUS OS")
-    print("=" * 50)
-    print()
-    print("1. Dashboard")
-    print("2. Services")
-    print("3. Bots")
-    print("4. Music")
-    print("5. Git")
-    print("6. Exit")
-    print()
 
-    choice = input("Select > ")
-
-    if choice == "6":
-        print("\nGoodbye, Captain! 🍋")
-        break
-
-    input("\nFeature coming soon... Press Enter.")
+if __name__ == "__main__":
+    main()
