@@ -260,9 +260,26 @@ def get_cpu_architecture() -> str:
 
 
 def get_cpu_count() -> str:
-    """Return the number of logical CPU cores as a string."""
-    count = os.cpu_count()
-    return str(count) if count else "Unavailable"
+    """Return the number of logical CPU cores as a string.
+
+    Parses /proc/cpuinfo and counts "processor" entries first, since
+    os.cpu_count() has been observed to under-report the real core
+    count on some Android/Termux devices. Falls back to
+    os.cpu_count() only if that parsing fails or finds nothing.
+    """
+    try:
+        processor_count = 0
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip().startswith("processor"):
+                    processor_count += 1
+        if processor_count > 0:
+            return str(processor_count)
+    except (OSError, ValueError):
+        pass
+
+    fallback = os.cpu_count()
+    return str(fallback) if fallback else "Unavailable"
 
 
 def get_ram_usage() -> str:
@@ -292,14 +309,20 @@ def get_ram_usage() -> str:
         return "Unavailable"
 
 
-def get_disk_usage(path: str = "/") -> str:
+def get_disk_usage(path: Optional[str] = None) -> str:
     """Return "used / total" disk space for the given path.
 
+    Defaults to the user's home directory rather than "/", because on
+    Android/Termux "/" reports the read-only system partition (which
+    shows near-zero free space) instead of the Termux-writable
+    storage the app actually runs from.
+
     Args:
-        path: Filesystem path to measure. Defaults to root.
+        path: Filesystem path to measure. Defaults to ``Path.home()``.
     """
+    target = path if path is not None else str(Path.home())
     try:
-        usage = shutil.disk_usage(path)
+        usage = shutil.disk_usage(target)
         return f"{format_bytes(usage.used)} / {format_bytes(usage.total)}"
     except OSError:
         return "Unavailable"
@@ -335,27 +358,78 @@ def get_battery_percentage() -> str:
     return "Unavailable"
 
 
-def get_uptime() -> str:
-    """Return system uptime as a short "1d 2h 3m" style string.
+def _format_uptime_seconds(seconds: float) -> str:
+    """Convert a duration in seconds into a short "1d 2h 3m" string.
 
-    Reads /proc/uptime directly (available on Termux/Linux). Returns
-    "Unavailable" if the file can't be read, e.g. on non-Linux systems.
+    Args:
+        seconds: Duration in seconds.
+    """
+    days, remainder = divmod(int(seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    parts = [f"{days}d"] if days else []
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _parse_uptime_command_output(output: str) -> Optional[str]:
+    """Extract a short, readable uptime phrase from `uptime` output.
+
+    Handles both GNU coreutils and BusyBox/Toybox styles, e.g.:
+    "03:22:01 up 1 day, 2:34, 0 users, load average: 0.10, 0.05, 0.01"
+    "up 1 day, 2:34"
+
+    Args:
+        output: Raw stdout from the "uptime" command.
+
+    Returns:
+        A cleaned phrase such as "1 day, 2:34", or None if the output
+        doesn't look like a recognizable uptime line.
+    """
+    if "up" not in output:
+        return None
+
+    after_up = output.split("up", 1)[1]
+    cleaned_chunks = []
+    for chunk in (part.strip() for part in after_up.split(",")):
+        if not chunk:
+            continue
+        if "load average" in chunk:
+            break
+        # Skip leftover "N users"/"N user" fragments once "user(s)" is removed.
+        stripped = chunk.replace("users", "").replace("user", "").strip()
+        if stripped.isdigit():
+            continue
+        cleaned_chunks.append(chunk)
+
+    return ", ".join(cleaned_chunks) if cleaned_chunks else None
+
+
+def get_uptime() -> str:
+    """Return system uptime as a short, human-readable string.
+
+    Tries /proc/uptime first (fast and precise), then falls back to
+    the "uptime" command, since /proc/uptime has been observed to
+    raise "Permission denied" on some Android/Termux devices. Returns
+    "Unavailable" if neither method works.
     """
     try:
         with open("/proc/uptime", "r", encoding="utf-8") as handle:
             seconds = float(handle.read().split()[0])
-
-        days, remainder = divmod(int(seconds), 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes, _ = divmod(remainder, 60)
-
-        parts = [f"{days}d"] if days else []
-        if hours or days:
-            parts.append(f"{hours}h")
-        parts.append(f"{minutes}m")
-        return " ".join(parts)
+        return _format_uptime_seconds(seconds)
     except (OSError, ValueError, IndexError):
-        return "Unavailable"
+        pass
+
+    output = run_command(["uptime"])
+    if output:
+        parsed = _parse_uptime_command_output(output)
+        if parsed:
+            return parsed
+
+    return "Unavailable"
 
 
 def show_placeholder(title: str, message: str = "Future feature.") -> None:
