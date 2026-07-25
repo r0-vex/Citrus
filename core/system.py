@@ -1,3 +1,12 @@
+"""
+system.py
+=========
+System information screen.
+
+Future home for CPU/RAM/storage/battery info relevant to running
+Citrus on the Galaxy J7 Max. Currently a placeholder.
+"""
+
 from utils import show_placeholder
 
 

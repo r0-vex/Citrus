@@ -1,3 +1,14 @@
+"""
+menu.py
+=======
+Main application loop and navigation.
+
+This is the "traffic controller" of Citrus: it draws the main menu,
+reads the user's choice, and hands control to the matching module.
+Every screen returns here when it's done, so the app never restarts
+between actions - it just loops.
+"""
+
 from typing import Callable, Dict
 
 from config import APP_NAME, ASCII_LOGO, MENU_WIDTH
