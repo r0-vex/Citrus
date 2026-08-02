@@ -218,3 +218,167 @@ Ready for:
 ```
 
 ---
+
+## 📅 Day 3 — Core Development & Architecture Redesign
+
+### Citrus Core Development
+
+Implemented the first functional version of the Citrus Core.
+
+Completed:
+
+- ✅ Built the first interactive menu system
+- ✅ Implemented Dashboard module
+- ✅ Added Service Manager skeleton
+- ✅ Added Git utilities module
+- ✅ Added System module
+- ✅ Created reusable helper utilities
+- ✅ Integrated configuration management
+- ✅ Successfully ran Citrus on the Android server
+
+The project evolved from a folder structure into a working terminal application.
+
+---
+
+### Dashboard Development
+
+Designed and implemented the first system dashboard.
+
+Displayed:
+
+- Hostname
+- Current User
+- Operating System
+- Kernel Version
+- Python Version
+- Git Version
+- Working Directory
+- SSH Status
+- Internet Status
+- Local IP Address
+- CPU Information
+- RAM Usage
+- Storage Usage
+- Battery Percentage
+- Runtime Information
+- Citrus Version
+
+---
+
+### Platform Compatibility Testing
+
+Extensively tested Citrus on the Samsung Galaxy J7 Max running Android 8.1 with Termux.
+
+Verified:
+
+- ✅ Dashboard rendering
+- ✅ Navigation system
+- ✅ SSH integration
+- ✅ Network detection
+- ✅ Storage detection
+- ✅ Battery detection
+- ✅ Python execution
+- ✅ Git integration
+
+---
+
+### Bug Investigation
+
+Performed extensive debugging of Android-specific behavior.
+
+Investigated:
+
+- CPU core detection inconsistency
+- Android `/proc` permission limitations
+- Uptime detection fallback
+- Storage partition detection
+- Termux-specific runtime behavior
+
+Several platform-specific quirks were identified that required architectural improvements instead of incremental patches.
+
+---
+
+### Architecture Review
+
+Reviewed the entire Citrus Core.
+
+Identified several design problems:
+
+- `utils.py` becoming a large utility module
+- Dashboard mixing data collection and rendering
+- Lack of centralized logging
+- Weak separation of responsibilities
+- Difficult debugging workflow
+- Limited long-term scalability
+
+Decided to stop feature development and redesign the Core before continuing.
+
+---
+
+### Citrus v1.0 Foundation Planning
+
+Designed the next-generation Citrus architecture.
+
+Planned improvements:
+
+- Dedicated logging framework
+- Event-driven architecture
+- Session management
+- Structured system collectors
+- Modular page system
+- Centralized configuration
+- Runtime state management
+- Custom exception hierarchy
+- Improved dependency flow
+- SOLID-based architecture
+
+The goal shifted from **"making Citrus work"** to **"building a professional server operating platform."**
+
+---
+
+## Lessons Learned
+
+Day 3 reinforced an important engineering principle:
+
+> Building more features on a weak foundation only creates more technical debt.
+
+Instead of continuing to patch platform-specific issues, the decision was made to redesign the Core into a scalable architecture capable of supporting future modules including Bots, Services, Git Management, Automation, Music Server, AI integrations, and a Web Dashboard.
+
+---
+
+## Current Status
+
+```text
+Infrastructure        ✅ Complete
+Remote Access         ✅ Complete
+Development Shell     ✅ Complete
+Git Workflow          ✅ Complete
+GitHub Integration    ✅ Complete
+SSH Authentication    ✅ Complete
+
+Citrus Core (v0.x)    ✅ Prototype Complete
+Architecture Review   ✅ Complete
+v1.0 Design           ✅ Finalized
+
+Next Milestone:
+⬜ Rewrite Core (v1.0)
+⬜ Logging Framework
+⬜ Event Bus
+⬜ Session Manager
+⬜ System Collectors
+⬜ Modular Dashboard
+```
+
+---
+
+## 🚀 Day 4 Objectives
+
+- Rewrite the Citrus Core using the finalized architecture.
+- Implement the foundation layer (configuration, constants, versioning, state, exceptions).
+- Build the centralized logging framework and event bus.
+- Create modular system information collectors.
+- Rebuild the menu and dashboard on the new architecture.
+- Verify the entire application runs cleanly on the Termux server.
+- Commit, push to GitHub, and deploy the rewritten Core to Citrus.
+
+---
