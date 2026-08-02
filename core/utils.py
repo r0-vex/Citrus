@@ -262,21 +262,31 @@ def get_cpu_architecture() -> str:
 def get_cpu_count() -> str:
     """Return the number of logical CPU cores as a string.
 
-    Parses /proc/cpuinfo and counts "processor" entries first, since
+    Parses /proc/cpuinfo and counts lines whose key (the text before
+    the first colon, stripped) is exactly "processor". This avoids
+    false matches against similarly-named but different fields such
+    as "Processor" (capitalized, used for the model name on some
+    ARM/Android kernels) or "model name".
+
     os.cpu_count() has been observed to under-report the real core
-    count on some Android/Termux devices. Falls back to
-    os.cpu_count() only if that parsing fails or finds nothing.
+    count on some Android/Termux devices, so it's used only as a
+    last-resort fallback, after trying "nproc" first.
     """
     try:
         processor_count = 0
         with open("/proc/cpuinfo", "r", encoding="utf-8") as handle:
             for line in handle:
-                if line.strip().startswith("processor"):
+                key = line.split(":", 1)[0].strip()
+                if key == "processor":
                     processor_count += 1
         if processor_count > 0:
             return str(processor_count)
     except (OSError, ValueError):
         pass
+
+    nproc_output = run_command(["nproc"])
+    if nproc_output and nproc_output.isdigit():
+        return nproc_output
 
     fallback = os.cpu_count()
     return str(fallback) if fallback else "Unavailable"
