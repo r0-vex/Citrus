@@ -9,7 +9,7 @@ in one place as the project grows.
 """
 
 APP_NAME: str = "Citrus"
-VERSION: str = "0.3.1"
+VERSION: str = "0.3.2"
 AUTHOR: str = "You"
 
 # Width used for headers/menus across the whole app, so every screen

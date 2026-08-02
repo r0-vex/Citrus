@@ -260,38 +260,14 @@ def get_cpu_architecture() -> str:
 
 
 def get_cpu_count() -> str:
-    print("=== DEBUG get_cpu_count ===")
+    count = 0
 
-    try:
-        processor_count = 0
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as handle:
-            for line in handle:
-                key = line.split(":", 1)[0].strip()
-                print(f"KEY={key!r} LINE={line!r}")
+    with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+        for line in f:
+            if line.split(":", 1)[0].strip() == "processor":
+                count += 1
 
-                if key == "processor":
-                    processor_count += 1
-                    print(f"COUNT -> {processor_count}")
-
-        print("FINAL COUNT:", processor_count)
-
-        if processor_count > 0:
-            return str(processor_count)
-
-    except Exception as e:
-        print("EXCEPTION:", repr(e))
-
-    print("Trying nproc...")
-    nproc_output = run_command(["nproc"])
-    print("nproc:", nproc_output)
-
-    if nproc_output and nproc_output.isdigit():
-        return nproc_output
-
-    print("os.cpu_count():", os.cpu_count())
-
-    fallback = os.cpu_count()
-    return str(fallback) if fallback else "Unavailable"
+    return str(count)
 
 
 def get_ram_usage() -> str:
