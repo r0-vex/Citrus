@@ -1,10 +1,7 @@
 """
 Citrus core package.
 
-Groups the application's control logic (entry point, menu, and
-feature modules) separately from data folders like bots/, services/,
-media/, logs/, etc. This package is intended to be run directly
-(e.g. ``python citrus.py`` from inside core/) during early
-development; a proper ``python -m`` package launcher can be added
-later without touching any module internals.
+Houses the entire application: entry point, bootstrap, navigation,
+UI, system-data collection, and pages. See citrus.py for the entry
+point and app.py for the startup/shutdown lifecycle.
 """

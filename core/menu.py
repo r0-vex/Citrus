@@ -1,85 +1,71 @@
 """
 menu.py
 =======
-Main application loop and navigation.
-
-This is the "traffic controller" of Citrus: it draws the main menu,
-reads the user's choice, and hands control to the matching module.
-Every screen returns here when it's done, so the app never restarts
-between actions - it just loops.
+Main navigation loop. Draws the main menu, reads the user's choice,
+and dispatches to the matching page's show() function. Contains no
+business logic or page content of its own - only routing. Startup/
+shutdown lifecycle (sessions, top-level error handling) lives one
+layer up, in app.py.
 """
 
 from typing import Callable, Dict
 
-from config import APP_NAME, ASCII_LOGO, MENU_WIDTH
-from utils import clear_screen, print_header, pause, show_placeholder
-from dashboard import dashboard
-from services import services_menu
-from git_tools import git_menu
-from system import system_menu
+from core import constants, state
+from core.logging.logger import get_logger
+from core.pages import bots, dashboard, git, music, services, system
+from core.ui import clear_screen, pause, print_header
+
+logger = get_logger(__name__)
+
+_PAGE_ACTIONS: Dict[str, Callable[[], None]] = {
+    constants.MenuID.DASHBOARD: dashboard.show,
+    constants.MenuID.SERVICES: services.show,
+    constants.MenuID.BOTS: bots.show,
+    constants.MenuID.MUSIC: music.show,
+    constants.MenuID.GIT: git.show,
+    constants.MenuID.SYSTEM: system.show,
+}
 
 
-def _bots_menu() -> None:
-    """Placeholder entry point for the Bots module."""
-    show_placeholder("Bots", "No bots configured yet.")
-
-
-def _music_menu() -> None:
-    """Placeholder entry point for the Music module."""
-    show_placeholder("Music Server", "Music server not set up yet.")
-
-
-def _print_menu() -> None:
+def _print_main_menu() -> None:
     """Render the main menu screen."""
     clear_screen()
-    print(ASCII_LOGO)
-    print_header("🍋 CITRUS CONTROL CENTER", MENU_WIDTH)
-    print(
-        "\n"
-        "1. Dashboard\n"
-        "2. Services\n"
-        "3. Bots\n"
-        "4. Music\n"
-        "5. Git\n"
-        "6. System\n"
-        "0. Exit\n"
-    )
+    print(constants.ASCII_LOGO)
+    print_header(f"{constants.ICON_LEMON} CITRUS CONTROL CENTER", constants.DEFAULT_MENU_WIDTH)
+    print()
+    for key, label in constants.MAIN_MENU_LABELS.items():
+        print(f"{key}. {label}")
+    print()
 
 
 def _exit_app() -> None:
     """Print a farewell message before the app closes."""
     clear_screen()
-    print(f"\nGoodbye from {APP_NAME}! 🍋\n")
+    print(f"\nGoodbye from {constants.APP_NAME}! {constants.ICON_LEMON}\n")
 
 
-def main_loop() -> None:
+def run() -> None:
     """Run the main menu loop until the user chooses to exit.
 
-    Reads a single keypress-style choice at a time, dispatches to the
-    matching module function, and re-draws the menu on return - this
-    is what makes navigation feel like Main Menu -> Page -> Back ->
-    Main Menu without ever restarting the process.
+    Reads one choice at a time, dispatches to the matching page, and
+    re-draws the menu on return, so navigation feels like Main Menu
+    -> Page -> Back -> Main Menu without ever restarting the process.
+    Returns normally on exit; app.py is responsible for anything that
+    needs to happen around the whole session's lifecycle.
     """
-    actions: Dict[str, Callable[[], None]] = {
-        "1": dashboard,
-        "2": services_menu,
-        "3": _bots_menu,
-        "4": _music_menu,
-        "5": git_menu,
-        "6": system_menu,
-    }
-
     while True:
-        _print_menu()
+        state.state.set_page("main_menu")
+        _print_main_menu()
         choice = input("Select an option: ").strip()
 
-        if choice == "0":
+        if choice == constants.MenuID.EXIT:
             _exit_app()
-            break
+            return
 
-        action = actions.get(choice)
+        action = _PAGE_ACTIONS.get(choice)
         if action is not None:
             action()
         else:
+            logger.debug("Invalid menu choice entered: %r", choice)
             print("\nInvalid option.")
             pause()
