@@ -1,3 +1,11 @@
+![Python](https://img.shields.io/badge/Python-3.14-blue)
+
+![Version](https://img.shields.io/badge/version-v1.1.0-success)
+
+![License](https://img.shields.io/badge/license-MIT-green)
+
+![Status](https://img.shields.io/badge/status-Active-success)
+
  # 🍋 Citrus
 
 > A lightweight personal homelab platform built on a repurposed Samsung Galaxy J7 Max using Termux.

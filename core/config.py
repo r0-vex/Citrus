@@ -29,6 +29,12 @@ LOG_FILES: Final[Dict[str, Path]] = {
     "debug": LOG_DIR / "debug.log",
 }
 
+# --- Service Manager layout ------------------------------------------------
+
+SERVICES_DIR: Final[Path] = PROJECT_ROOT / "services"
+SERVICE_LOG_DIR: Final[Path] = LOG_DIR / "services"
+SERVICE_STATE_FILE: Final[Path] = PROJECT_ROOT / "temp" / "service_manager_state.json"
+
 # --- Logging format --------------------------------------------------------
 
 LOG_FORMAT: Final[str] = "[%(asctime)s]\n%(levelname)s\n%(name)s\n%(message)s\n"
@@ -58,3 +64,21 @@ def ensure_log_directory() -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ConfigurationError(f"Could not create log directory {LOG_DIR}: {exc}") from exc
+
+
+def ensure_service_runtime_directories() -> None:
+    """Create service-manager runtime directories if they don't exist.
+
+    Covers the per-service log directory (logs/services/) and the
+    parent directory of the service runtime-state file. Safe to call
+    multiple times.
+
+    Raises:
+        ConfigurationError: If a directory can't be created, e.g.
+            due to a permissions issue.
+    """
+    try:
+        SERVICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        SERVICE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigurationError(f"Could not create service runtime directories: {exc}") from exc
