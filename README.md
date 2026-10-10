@@ -1,6 +1,6 @@
 ![Python](https://img.shields.io/badge/Python-3.14-blue)
 
-![Version](https://img.shields.io/badge/version-v1.1.0-success)
+![Version](https://img.shields.io/badge/version-v1.2.0-success)
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -69,6 +69,11 @@ Current capabilities:
 - Service lifecycle management
 - Process cleanup
 - Cross-platform process handling
+- Restart-count and lifecycle timestamp tracking
+- Atomic service-state persistence
+- Malformed persisted-state recovery
+- Strict service-definition validation
+- Failed-stop state recovery
 
 Service architecture:
 
@@ -283,6 +288,11 @@ Testing currently covers:
 - PID tracking
 - Service persistence
 - Cross-platform process handling
+- Restart-count and lifecycle timestamp tracking
+- Atomic service-state persistence
+- Malformed persisted-state recovery
+- Strict service-definition validation
+- Failed-stop state recovery
 - Termux compatibility
 
 The Service Manager has been specifically validated against the real Android / Termux environment.
@@ -319,6 +329,10 @@ The development log records the evolution of Citrus from the initial Android ser
 - [x] Windows testing
 - [x] Termux testing
 - [x] Android server validation
+- [x] Service-state persistence hardening
+- [x] Lifecycle metadata and restart tracking
+- [x] Service registry validation
+- [x] Windows and Termux heartbeat smoke tests
 
 ### Planned
 
@@ -361,11 +375,11 @@ Every new capability will be developed, tested, documented, and deployed increme
 
 ## 📌 Current Release
 
-**Citrus v1.1.0**
+**Citrus v1.2.0**
 
 Current milestone:
 
-> **Core v1.0 + Service Manager**
+> **Core v1.0 + Hardened Service Manager**
 
 ---
 

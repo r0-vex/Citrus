@@ -832,3 +832,106 @@ Only then build the next feature.
 Citrus is no longer just a collection of scripts.
 
 It is becoming a modular server control platform.
+
+
+---
+
+## 📅 Day 5 — Service Manager Hardening
+
+### State Persistence & Recovery
+
+Hardened service runtime-state handling so corrupted persisted data is less likely to prevent Citrus from loading valid service state.
+
+Implemented:
+
+- Validate the top-level persisted-state structure.
+- Discard malformed individual entries while retaining valid entries.
+- Parse persisted restart counts strictly: only non-negative integers are accepted; missing values default to zero.
+- Treat invalid optional timestamps as absent.
+- Save runtime state atomically.
+- Preserve lifecycle history when creating replacement runtime-state objects.
+
+### Service Lifecycle Metadata
+
+Expanded `ServiceRuntimeState` and the Services page with:
+
+- Restart count
+- Last exit timestamp
+- Last stopped timestamp
+- Last error information
+
+The status check also handles a process whose PID no longer exists by marking the service as failed and recording exit information.
+
+### Stop & Restart Reliability
+
+Improved lifecycle operations to preserve state history and avoid accidental mutation of the previous state during a stop attempt.
+
+- Snapshot the previous state before changing it to `STOPPING`.
+- Restore the previous state if stopping fails.
+- Preserve restart history across start/stop/restart operations.
+- Increment the restart count once after a successful stop-and-start cycle.
+- Preserve the runtime state file locally while removing it from version control.
+
+### Service Registry Validation
+
+Tightened service-definition validation:
+
+- Service IDs must contain only letters, digits, underscores, or hyphens.
+- `enabled` and `auto_restart` must be actual JSON booleans.
+- Invalid definitions are rejected instead of being silently coerced.
+
+### Test & Verification Record
+
+Targeted checks performed during Day 5:
+
+- ✅ `python -m compileall -q .` on Windows and Termux
+- ✅ `git diff --check` and staged diff whitespace checks
+- ✅ Restart-count parsing checks for valid and invalid values
+- ✅ Corrupt persisted-state checks, including preservation of valid entries
+- ✅ Mocked failed-stop recovery check
+- ✅ Windows heartbeat start, restart, and stop smoke test
+- ✅ Termux deployment at commit `c438685`
+- ✅ Termux heartbeat start, restart, and stop smoke test
+- ✅ Final Termux Git check confirmed `HEAD`, `main`, and `origin/main` at `c438685`, with a clean working tree
+
+These were targeted validation checks, not a claim that a comprehensive automated regression suite exists.
+
+### Git & Deployment
+
+- ✅ Committed the hardening changes as `c438685` (`Harden service manager state handling`)
+- ✅ Pushed the commit to GitHub
+- ✅ Pulled the commit onto Citrus-01
+- ✅ Confirmed the deployed commit matches `origin/main`
+- ✅ Updated this development log and README for the Day 5 milestone
+- ⬜ Commit the documentation update
+- ⬜ Create and push the `v1.2.0` release tag after documentation is committed
+
+### Day 5 Final Status
+
+```text
+Service-State Validation       ✅ Complete
+Atomic State Persistence       ✅ Complete
+Lifecycle Metadata             ✅ Complete
+Stop/Restart State Recovery    ✅ Complete
+Registry Validation            ✅ Complete
+Windows Heartbeat Smoke Test   ✅ Passed
+Termux Heartbeat Smoke Test    ✅ Passed
+Targeted Persistence Checks    ✅ Passed
+GitHub Deployment              ✅ Complete
+Release Documentation          ✅ Drafts prepared
+Release Tag                    ⬜ Pending
+```
+
+---
+
+## 🍋 Next Phase
+
+### Day 6 — Service Manager Edge-Case Testing
+
+Recommended next focus:
+
+- ⬜ Verify unexpected process-exit handling
+- ⬜ Exercise malformed-state recovery against a disposable test state file
+- ⬜ Test restart behavior when stopping or starting fails
+- ⬜ Decide whether to build a repeatable automated regression suite
+- ⬜ Only then move into the next major feature
