@@ -15,6 +15,7 @@ another *.json file in services/.
 """
 
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,6 +28,60 @@ from core.service_manager.models import ServiceDefinition
 logger = get_logger(__name__)
 
 _REQUIRED_FIELDS = ("id", "name", "command")
+
+# Service ids end up in filesystem paths (logs/services/<id>.log), so
+# they're restricted to a safe, unambiguous character set. This
+# rejects path separators, "..", spaces, and empty strings, any of
+# which could otherwise enable path traversal or produce a broken path.
+_SERVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_valid_service_id(service_id: str) -> bool:
+    """Check whether a service id is safe to use in filesystem paths.
+
+    Args:
+        service_id: The candidate id to check.
+
+    Returns:
+        True if the id matches ^[A-Za-z0-9_-]+$ exactly.
+    """
+    return bool(_SERVICE_ID_PATTERN.fullmatch(service_id))
+
+
+def _validate_optional_bool(raw: dict, field_name: str, default: bool, source: Path) -> Optional[bool]:
+    """Validate an optional field that must be a real JSON boolean.
+
+    Rejects anything that isn't a literal JSON true/false - including
+    the strings "true"/"false" and the integers 1/0 - since silently
+    coercing those (e.g. via a bare bool() cast) can produce
+    surprising results like bool("false") == True.
+
+    Args:
+        raw: The service definition dict.
+        field_name: Which field to validate ("enabled" or "auto_restart").
+        default: Value to use if the field is absent entirely.
+        source: The file it came from, for the warning message.
+
+    Returns:
+        The field's boolean value (or `default` if the field is
+        absent), or None if the field is present but not a real JSON
+        boolean - the caller must treat None as "reject this
+        definition".
+    """
+    if field_name not in raw:
+        return default
+
+    value = raw[field_name]
+    if isinstance(value, bool):
+        return value
+
+    logger.warning(
+        "Skipping %s: '%s' must be a JSON boolean (true/false), got %r",
+        source,
+        field_name,
+        value,
+    )
+    return None
 
 
 def _resolve_working_directory(raw_value: Optional[str]) -> Path:
@@ -94,6 +149,15 @@ def _parse_definition(raw: dict, source: Path) -> Optional[ServiceDefinition]:
         logger.warning("Skipping %s: missing required field(s) %s", source, missing)
         return None
 
+    raw_id = raw.get("id")
+    if not isinstance(raw_id, str) or not _is_valid_service_id(raw_id):
+        logger.warning(
+            "Skipping %s: invalid service id %r (must be a non-empty string matching ^[A-Za-z0-9_-]+$)",
+            source,
+            raw_id,
+        )
+        return None
+
     command = _parse_command(raw["command"])
     if command is None:
         logger.warning("Skipping %s: 'command' must be a non-empty string or list of strings", source)
@@ -104,15 +168,23 @@ def _parse_definition(raw: dict, source: Path) -> Optional[ServiceDefinition]:
         logger.warning("Skipping %s: 'environment' must be an object", source)
         return None
 
+    enabled = _validate_optional_bool(raw, "enabled", True, source)
+    if enabled is None:
+        return None
+
+    auto_restart = _validate_optional_bool(raw, "auto_restart", False, source)
+    if auto_restart is None:
+        return None
+
     try:
         return ServiceDefinition(
-            id=str(raw["id"]),
+            id=raw_id,
             name=str(raw["name"]),
             command=command,
             working_directory=_resolve_working_directory(raw.get("working_directory")),
             environment={str(key): str(value) for key, value in environment.items()},
-            enabled=bool(raw.get("enabled", True)),
-            auto_restart=bool(raw.get("auto_restart", False)),
+            enabled=enabled,
+            auto_restart=auto_restart,
         )
     except (TypeError, ValueError) as exc:
         logger.warning("Skipping %s: %s", source, exc)

@@ -1,7 +1,7 @@
 {
   "id": "test_heartbeat",
   "name": "Test Heartbeat (dev only)",
-  "command": ["python3", "scripts/test_heartbeat.py"],
+  "command": ["python", "scripts/test_heartbeat.py"],
   "working_directory": ".",
   "environment": {},
   "enabled": true,

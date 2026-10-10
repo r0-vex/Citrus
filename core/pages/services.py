@@ -72,8 +72,10 @@ def _print_service_detail(definition: ServiceDefinition, state: ServiceRuntimeSt
     runtime = state.runtime_seconds()
     print_row("Runtime", f"{int(runtime)}s" if runtime is not None else "-")
 
-    if state.last_error:
-        print_row("Last error", state.last_error)
+    print_row("Restarts", str(state.restart_count))
+    print_row("Last Exit", state.last_exit_at.strftime("%Y-%m-%d %H:%M:%S") if state.last_exit_at else "-")
+    print_row("Last Stopped", state.last_stopped_at.strftime("%Y-%m-%d %H:%M:%S") if state.last_stopped_at else "-")
+    print_row("Last Error", state.last_error if state.last_error else "-")
 
     print()
     print("1. Start")
