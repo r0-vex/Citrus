@@ -20,6 +20,7 @@ from core.logging.events import EventNames, emit
 from core.logging.logger import get_logger
 from core.service_manager import registry, runner
 from core.service_manager.models import ServiceDefinition, ServiceOperationResult, ServiceRuntimeState, ServiceStatus
+from core.service_manager.runner import IdentityVerificationResult
 
 logger = get_logger(__name__)
 
@@ -134,13 +135,21 @@ class ServiceManager:
     def get_status(self, definition: ServiceDefinition) -> ServiceRuntimeState:
         """Return a service's current status, verified against the OS.
 
-        Never trusts a stored PID at face value - always confirms the
-        process is actually alive via runner.is_running(), and
-        corrects stale state accordingly. A PID that's gone while
-        Citrus still believed the service was RUNNING is, by
-        construction, always an unexpected exit - an intentional stop
-        always clears the PID itself (see stop_service()), so this
-        code path can never be reached as a result of one.
+        Never trusts a stored PID at face value.  Uses
+        runner.verify_process_identity() to confirm the process currently
+        holding the PID is the same process Citrus started.  Each
+        verification result maps to a distinct state transition:
+
+        - No PID stored: return stored state unchanged (nothing to check).
+        - Legacy state (PID stored, identity=None): immediately transition
+          to UNKNOWN and clear the PID.  A legacy bare PID will NEVER be
+          used to send any OS signal.
+        - MATCH: process is alive and is our service; mark RUNNING if not
+          already.
+        - EXITED: PID is gone; transition to FAILED with last_exit_at.
+        - MISMATCH: PID was recycled; transition to FAILED, clear PID.
+        - INCONCLUSIVE: check could not be completed; transition to UNKNOWN,
+          preserve PID for triage, block all signals.
 
         Only logs/emits when the status actually changes - repeatedly
         calling this for an unchanged, healthy service (e.g. the UI
@@ -154,32 +163,100 @@ class ServiceManager:
         """
         state = self._runtime_state.get(definition.id, ServiceRuntimeState())
 
-        if state.pid is not None:
-            if runner.is_running(state.pid):
-                if state.status != ServiceStatus.RUNNING:
-                    state.status = ServiceStatus.RUNNING
-                    self._runtime_state[definition.id] = state
-                    self._save_state()
-                    emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
-            else:
-                logger.warning(
-                    "Service '%s' PID %s is no longer alive; treating as an unexpected exit",
-                    definition.id,
-                    state.pid,
-                )
-                state = ServiceRuntimeState(
-                    status=ServiceStatus.FAILED,
-                    last_exit_code=None,  # We only learn about this after the fact - the
-                    # OS gives us no reliable exit code this way, so we stay honest
-                    # rather than inventing one.
-                    last_error="Process exited unexpectedly (no longer running).",
-                    last_exit_at=datetime.now(),
-                    restart_count=state.restart_count,
-                )
+        if state.pid is None:
+            return state
+
+        # ---- Legacy state: PID present but no identity baseline ----------
+        # State files written before process identity support have no identity field.
+        # We cannot safely signal such a PID; transition to UNKNOWN and
+        # clear the PID so the service must be restarted to get a baseline.
+        if state.identity is None:
+            logger.warning(
+                "Service '%s' PID %s has no identity baseline (legacy state); "
+                "clearing PID and marking UNKNOWN.",
+                definition.id, state.pid,
+            )
+            state = ServiceRuntimeState(
+                status=ServiceStatus.UNKNOWN,
+                pid=None,
+                identity=None,
+                last_error="Legacy state: PID cleared (no process identity baseline). Restart the service.",
+                restart_count=state.restart_count,
+                last_stopped_at=state.last_stopped_at,
+                last_exit_at=state.last_exit_at,
+            )
+            self._runtime_state[definition.id] = state
+            self._save_state()
+            emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
+            return state
+
+        # ---- Identity verification ----------------------------------------
+        verification = runner.verify_process_identity(state.identity)
+
+        if verification == IdentityVerificationResult.MATCH:
+            if state.status != ServiceStatus.RUNNING:
+                state.status = ServiceStatus.RUNNING
                 self._runtime_state[definition.id] = state
                 self._save_state()
                 emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
+            return state
 
+        if verification == IdentityVerificationResult.EXITED:
+            logger.warning(
+                "Service '%s' PID %s is no longer alive (EXITED); treating as an unexpected exit.",
+                definition.id, state.pid,
+            )
+            state = ServiceRuntimeState(
+                status=ServiceStatus.FAILED,
+                pid=None,
+                identity=None,
+                last_exit_code=None,
+                last_error="Process exited unexpectedly (no longer running).",
+                last_exit_at=datetime.now(),
+                restart_count=state.restart_count,
+            )
+            self._runtime_state[definition.id] = state
+            self._save_state()
+            emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
+            return state
+
+        if verification == IdentityVerificationResult.MISMATCH:
+            logger.warning(
+                "Service '%s' PID %s identity MISMATCH (PID recycled); clearing PID and marking FAILED.",
+                definition.id, state.pid,
+            )
+            state = ServiceRuntimeState(
+                status=ServiceStatus.FAILED,
+                pid=None,
+                identity=None,
+                last_exit_code=None,
+                last_error="PID recycled by a different process (identity mismatch).",
+                last_exit_at=datetime.now(),
+                restart_count=state.restart_count,
+            )
+            self._runtime_state[definition.id] = state
+            self._save_state()
+            emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
+            return state
+
+        # INCONCLUSIVE: verification failed (permission error, /proc error, etc.)
+        # Preserve the PID for triage; mark UNKNOWN; block all signals.
+        logger.warning(
+            "Service '%s' PID %s identity verification INCONCLUSIVE; marking UNKNOWN.",
+            definition.id, state.pid,
+        )
+        state = ServiceRuntimeState(
+            status=ServiceStatus.UNKNOWN,
+            pid=state.pid,
+            identity=state.identity,  # Preserve for retry
+            last_error="Process identity verification inconclusive (permission denied or /proc read error).",
+            restart_count=state.restart_count,
+            last_stopped_at=state.last_stopped_at,
+            last_exit_at=state.last_exit_at,
+        )
+        self._runtime_state[definition.id] = state
+        self._save_state()
+        emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
         return state
 
     def get_log_path(self, definition: ServiceDefinition) -> Path:
@@ -271,7 +348,7 @@ class ServiceManager:
 
         self._mark_transient_status(definition.id, ServiceStatus.STOPPING)
 
-        result = runner.stop(current.pid)
+        result = runner.stop(current.pid, current.identity)
 
         if result.success:
             self._runtime_state[definition.id] = ServiceRuntimeState(

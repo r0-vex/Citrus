@@ -6,6 +6,16 @@ definition (what to run), its runtime state (what's happening right
 now), and structured results from manager/runner operations. No
 process-control behavior lives here - only data and small, obvious
 helpers.
+
+Process identity
+----------------
+ProcessIdentity captures a platform-specific fingerprint of a running
+process at the moment Citrus starts it.  A bare PID stored in the
+state file can be recycled by an unrelated process after the original
+service exits; ProcessIdentity lets runner.py detect that mismatch
+before issuing any OS signals.
+
+See runner.verify_process_identity() for the verification logic.
 """
 
 from dataclasses import dataclass, field
@@ -13,6 +23,41 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Immutable OS-level fingerprint of one specific process instance.
+
+    A PID alone cannot prove that the process currently holding it is
+    the same process Citrus started, because PIDs are recycled by the
+    OS once a process exits.  ProcessIdentity adds a creation-time
+    token that lets runner.py reject a recycled PID before issuing any
+    signal.
+
+    Attributes:
+        pid: The process ID, mirrored here for cross-checking.
+        platform: ``"nt"`` on Windows, ``"posix"`` on Linux/Android/Termux.
+        start_time: Platform-specific creation-time token:
+            - POSIX: the ``starttime`` field (field 22) from
+              ``/proc/<pid>/stat``, measured in clock ticks since
+              system boot.  Monotonically increasing within a boot and
+              unique per PID within the same boot.
+            - Windows: the process creation time as a 64-bit Windows
+              FILETIME integer (100-nanosecond intervals since
+              1601-01-01).  Obtained via ``GetProcessTimes``.
+        boot_id: On Linux, the UUID from
+            ``/proc/sys/kernel/random/boot_id`` recorded at the moment
+            the service was started.  Used to immediately reject any
+            persisted PID after a system reboot, even before reading
+            ``/proc/<pid>/stat``.  ``None`` on Windows or when the
+            file was unreadable.
+    """
+
+    pid: int
+    platform: str          # "nt" or "posix"
+    start_time: int        # POSIX: clock ticks; Windows: 64-bit FILETIME
+    boot_id: Optional[str] = None  # Linux only; None on Windows
 
 
 class ServiceStatus(str, Enum):
@@ -60,6 +105,16 @@ class ServiceRuntimeState:
         status: Current lifecycle state.
         pid: Process ID, if currently running (or last known before a
             stop/failure was recorded).
+        identity: Process identity fingerprint captured immediately after
+            the service was started.  None for stopped/failed services,
+            legacy state files written before process identity support,
+            or the rare case where identity capture fails because the
+            process exited before /proc could be read (on POSIX) or
+            GetProcessTimes returned an error (on Windows).
+
+            A non-None identity must be verified by runner.verify_process_identity()
+            before any OS signal is sent.  A None identity disables
+            signalling - the service must be started fresh.
         started_at: When the process was last started, if known for
             this session (not reconstructed across restarts).
         last_exit_code: Exit code from the most recent run, if known.
@@ -85,6 +140,7 @@ class ServiceRuntimeState:
 
     status: ServiceStatus = ServiceStatus.STOPPED
     pid: Optional[int] = None
+    identity: Optional[ProcessIdentity] = None
     started_at: Optional[datetime] = None
     last_exit_code: Optional[int] = None
     last_error: Optional[str] = None
@@ -111,12 +167,27 @@ class ServiceRuntimeState:
         persisted - it reflects an in-memory session's start time and
         is never meant to be reconstructed across a Citrus restart.
 
+        identity is serialized as a nested dict when present so it
+        survives a Citrus restart and can be re-verified next session.
+        A missing or null identity in the stored dict is treated as
+        "no baseline" on load, which disables signalling for that entry
+        until the service is re-started.
+
         Returns:
             A plain, JSON-serializable dict.
         """
+        identity_dict: Optional[Dict[str, object]] = None
+        if self.identity is not None:
+            identity_dict = {
+                "pid": self.identity.pid,
+                "platform": self.identity.platform,
+                "start_time": self.identity.start_time,
+                "boot_id": self.identity.boot_id,
+            }
         return {
             "status": self.status.value,
             "pid": self.pid,
+            "identity": identity_dict,
             "last_exit_code": self.last_exit_code,
             "last_error": self.last_error,
             "last_exit_at": self.last_exit_at.isoformat() if self.last_exit_at else None,
@@ -129,9 +200,23 @@ class ServiceRuntimeState:
         """Deserialize a persisted dict back into a ServiceRuntimeState.
 
         Backward compatible with state files written before
-        last_exit_at/last_stopped_at/restart_count existed - missing
-        fields fall back to sensible defaults rather than raising.
-        started_at is never restored from disk (see to_persisted_dict).
+        last_exit_at/last_stopped_at/restart_count/identity existed -
+        missing fields fall back to sensible defaults rather than
+        raising.  started_at is never restored from disk (see
+        to_persisted_dict).
+
+        Identity deserialisation notes
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        A missing or null ``"identity"`` key yields ``identity=None``,
+        which is safe and backward-compatible.  A present identity dict
+        with invalid field values (wrong types, negative start_time, etc.)
+        or whose PID does not match the outer ``"pid"`` is treated the
+        same as a missing identity: set to None and the state is still loaded.
+        This ensures an inconsistent state cannot authorize process signalling.
+        This is deliberately more lenient than pid/status parsing because a damaged
+        identity baseline is recoverable (the service will be marked UNKNOWN and
+        re-started), whereas a bad status value indicates a fundamentally corrupt
+        entry.
 
         Args:
             entry: One service's raw dict, as loaded from the state
@@ -141,14 +226,21 @@ class ServiceRuntimeState:
             A ServiceRuntimeState reconstructed from the dict.
 
         Raises:
-            ValueError: If "status" isn't a recognized ServiceStatus
-                value. Callers should catch this per-entry so one
-                corrupt service's state doesn't discard every other
+            ValueError: If ``"status"`` isn't a recognized ServiceStatus
+                value, or if ``"pid"`` is present but not a valid positive
+                integer or null. Callers should catch this per-entry so
+                one corrupt service's state doesn't discard every other
                 service's state too.
         """
+        pid = _parse_pid(entry.get("pid"))
+        identity = _parse_process_identity(entry.get("identity"))
+        if pid is None or (identity is not None and identity.pid != pid):
+            identity = None
+
         return cls(
             status=ServiceStatus(entry.get("status", ServiceStatus.UNKNOWN.value)),
-            pid=entry.get("pid"),
+            pid=pid,
+            identity=identity,
             started_at=None,
             last_exit_code=entry.get("last_exit_code"),
             last_error=entry.get("last_error"),
@@ -179,6 +271,99 @@ def _parse_restart_count(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"invalid restart_count {value!r} (must be a non-negative integer)")
     return value
+
+
+def _parse_pid(value: object) -> Optional[int]:
+    """Strictly validate a persisted pid.
+
+    None is accepted - it means no process is associated.  A positive
+    integer is accepted.  Anything else (bool, float, string, zero,
+    or a negative number) is rejected so a corrupt state entry can be
+    cleanly discarded by _load_state() without crashing the runner.
+
+    Booleans are tested before integers because bool is a subclass of
+    int in Python (isinstance(True, int) is True), matching the same
+    pattern used by _parse_restart_count.
+
+    Args:
+        value: The raw persisted value.
+
+    Returns:
+        A positive int, or None.
+
+    Raises:
+        ValueError: If the value is present but not None or a positive
+            integer.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"invalid pid {value!r} (must be a positive integer or null)")
+    return value
+
+
+def _parse_process_identity(value: object) -> Optional["ProcessIdentity"]:
+    """Parse a persisted identity dict back into a ProcessIdentity, tolerating bad input.
+
+    Unlike _parse_pid/_parse_restart_count, a corrupted or unrecognised
+    identity block yields None rather than raising.  A damaged identity
+    baseline is recoverable - the service will be flagged UNKNOWN and
+    restarted - whereas a bad pid or status value makes the whole entry
+    unsalvageable.
+
+    Args:
+        value: The raw persisted value - expected to be a dict with
+            ``pid``, ``platform``, ``start_time``, and optional ``boot_id``
+            keys, or None.
+
+    Returns:
+        A ProcessIdentity, or None if the value is absent or invalid.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    try:
+        pid_raw = value.get("pid")
+        platform_raw = value.get("platform")
+        start_time_raw = value.get("start_time")
+        boot_id_raw = value.get("boot_id")
+
+        # pid: positive integer, same rules as _parse_pid
+        if (
+            isinstance(pid_raw, bool)
+            or not isinstance(pid_raw, int)
+            or pid_raw <= 0
+        ):
+            return None
+
+        # platform: must be "nt" or "posix"
+        if platform_raw not in ("nt", "posix"):
+            return None
+
+        # start_time: non-negative integer (0 is a valid FILETIME on Windows
+        # only in theory; in practice both platforms return positive values,
+        # but we allow 0 rather than incorrectly rejecting a valid Windows
+        # FILETIME from early January 1601)
+        if (
+            isinstance(start_time_raw, bool)
+            or not isinstance(start_time_raw, int)
+            or start_time_raw < 0
+        ):
+            return None
+
+        # boot_id: None or a non-empty string
+        if boot_id_raw is not None and not isinstance(boot_id_raw, str):
+            return None
+
+        return ProcessIdentity(
+            pid=pid_raw,
+            platform=platform_raw,
+            start_time=start_time_raw,
+            boot_id=boot_id_raw if boot_id_raw else None,
+        )
+    except Exception:  # pragma: no cover — defensive belt-and-suspenders
+        return None
 
 
 def _parse_optional_datetime(value: object) -> Optional[datetime]:
