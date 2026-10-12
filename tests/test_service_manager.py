@@ -86,7 +86,10 @@ Coverage:
         - Generic OSError on getpgid → returns quietly, no kill
 """
 
+import json
+import os
 import sys
+import time
 import types
 import unittest
 import tempfile
@@ -138,20 +141,32 @@ def _stub_if_absent(module_name: str, attrs: dict) -> None:
 
 
 # core.logging.logger — provides get_logger(); used by runner.py
+import logging as _stdlib_logging
+
 _stub_if_absent(
     "core.logging.logger",
-    {"get_logger": lambda name: MagicMock()},
+    {
+        "get_logger": lambda name: MagicMock(),
+        "build_file_handler": lambda path, level: _stdlib_logging.NullHandler(),
+    },
 )
 
-# core.config — provides SERVICE_LOG_DIR and ensure_service_runtime_directories()
+# core.config — provides layout paths and directory helpers
 # Points to an uncreated sentinel directory under tempfile.gettempdir() so that
 # any test invoking runner.start() without explicitly patching SERVICE_LOG_DIR
 # fails immediately instead of polluting the global temporary directory.
 _stub_if_absent(
     "core.config",
     {
+        "PROJECT_ROOT": _PROJECT_ROOT,
+        "SERVICES_DIR": _PROJECT_ROOT / "services",
         "SERVICE_LOG_DIR": Path(tempfile.gettempdir()) / "citrus_unpatched_test_logs_sentinel",
+        "SERVICE_STATE_FILE": Path(tempfile.gettempdir()) / "citrus_unpatched_test_state.json",
+        "LOG_FILES": {"events": Path(tempfile.gettempdir()) / "citrus_test_events.log"},
+        "ensure_log_directory": lambda: None,
         "ensure_service_runtime_directories": lambda: None,
+        "MENU_WIDTH": 50,
+        "LABEL_WIDTH": 24,
     },
 )
 
@@ -159,13 +174,18 @@ _stub_if_absent(
 # Now it is safe to import the modules under test.
 # ---------------------------------------------------------------------------
 from core.service_manager.models import (  # noqa: E402
+    HealthCheckConfig,
     ProcessIdentity,
-    _parse_pid,
-    _parse_process_identity,
     ServiceDefinition,
+    ServiceHealth,
     ServiceRuntimeState,
     ServiceStatus,
+    _parse_pid,
+    _parse_process_identity,
 )
+from core.service_manager import health as health_evaluator  # noqa: E402
+from core.service_manager import manager as manager_module  # noqa: E402
+from core.service_manager import registry  # noqa: E402
 from core.service_manager import runner  # noqa: E402
 from core.service_manager.runner import (  # noqa: E402
     IdentityVerificationResult,
@@ -173,6 +193,8 @@ from core.service_manager.runner import (  # noqa: E402
     _configure_kernel32,
     _get_kernel32,
 )
+from core.logging.events import EventNames  # noqa: E402
+from core.pages import services as services_page  # noqa: E402
 
 
 # ===========================================================================
@@ -1810,6 +1832,724 @@ class TestWindowsCtypesSignatures(unittest.TestCase):
         p = ctypes.c_void_p(0)
         self.assertIsNone(p.value)
         self.assertFalse(p.value)
+
+
+# ===========================================================================
+# TestHealthCheckConfigParsing
+# ===========================================================================
+class TestHealthCheckConfigParsing(unittest.TestCase):
+    """Verify parsing and validation of service health_check configurations."""
+
+    def test_valid_heartbeat_file_config(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "heartbeat_file",
+                "target": "temp/bot.heartbeat",
+                "timeout_seconds": 5.0,
+                "max_age_seconds": 60.0,
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNotNone(defn)
+        assert defn is not None
+        self.assertIsNotNone(defn.health_check)
+        assert defn.health_check is not None
+        self.assertEqual(defn.health_check.type, "heartbeat_file")
+        self.assertEqual(defn.health_check.target, "temp/bot.heartbeat")
+        self.assertEqual(defn.health_check.timeout_seconds, 5.0)
+        self.assertEqual(defn.health_check.max_age_seconds, 60.0)
+
+    def test_valid_http_config(self) -> None:
+        raw = {
+            "id": "web_svc",
+            "name": "Web Service",
+            "command": "python app.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://127.0.0.1:8080/health",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/web_svc.json"))
+        self.assertIsNotNone(defn)
+        assert defn is not None
+        self.assertIsNotNone(defn.health_check)
+        assert defn.health_check is not None
+        self.assertEqual(defn.health_check.type, "http")
+        self.assertEqual(defn.health_check.target, "http://127.0.0.1:8080/health")
+        self.assertEqual(defn.health_check.timeout_seconds, 2.0)
+        self.assertEqual(defn.health_check.max_age_seconds, 30.0)
+
+    def test_valid_tcp_config_int_port(self) -> None:
+        raw = {
+            "id": "tcp_svc",
+            "name": "TCP Service",
+            "command": "python server.py",
+            "health_check": {
+                "type": "tcp",
+                "target": 9000,
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/tcp_svc.json"))
+        self.assertIsNotNone(defn)
+        assert defn is not None
+        self.assertIsNotNone(defn.health_check)
+        assert defn.health_check is not None
+        self.assertEqual(defn.health_check.type, "tcp")
+        self.assertEqual(defn.health_check.target, "127.0.0.1:9000")
+
+    def test_valid_tcp_config_host_port(self) -> None:
+        raw = {
+            "id": "tcp_svc",
+            "name": "TCP Service",
+            "command": "python server.py",
+            "health_check": {
+                "type": "tcp",
+                "target": "localhost:9000",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/tcp_svc.json"))
+        self.assertIsNotNone(defn)
+        assert defn is not None
+        self.assertEqual(defn.health_check.target, "localhost:9000")
+
+    def test_rejection_of_boolean_timeout(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://127.0.0.1:8080/health",
+                "timeout_seconds": True,
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_negative_timeout(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://127.0.0.1:8080/health",
+                "timeout_seconds": -1.0,
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_external_http_target(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://example.com/health",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_http_target_with_credentials(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://user:pass@127.0.0.1:8080/health",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_non_http_scheme(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "ftp://127.0.0.1:8080/health",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_non_loopback_tcp_target(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "tcp",
+                "target": "192.168.1.50:8080",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_heartbeat_path_traversal(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "heartbeat_file",
+                "target": "../etc/passwd",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_missing_health_check_defaults_to_none(self) -> None:
+        raw = {
+            "id": "my_svc",
+            "name": "My Service",
+            "command": "python bot.py",
+        }
+        defn = registry._parse_definition(raw, Path("services/my_svc.json"))
+        self.assertIsNotNone(defn)
+        assert defn is not None
+        self.assertIsNone(defn.health_check)
+
+    def test_rejection_of_non_integer_http_port_127_0_0_1(self) -> None:
+        raw = {
+            "id": "bad_port_svc",
+            "name": "Bad Port Svc",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://127.0.0.1:abc",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/bad_port_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_non_integer_http_port_localhost(self) -> None:
+        raw = {
+            "id": "bad_port_svc",
+            "name": "Bad Port Svc",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://localhost:invalid",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/bad_port_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_rejection_of_out_of_range_http_port(self) -> None:
+        raw = {
+            "id": "bad_port_svc",
+            "name": "Bad Port Svc",
+            "command": "python bot.py",
+            "health_check": {
+                "type": "http",
+                "target": "http://127.0.0.1:70000",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/bad_port_svc.json"))
+        self.assertIsNone(defn)
+
+    def test_valid_tcp_config_bracketed_ipv6(self) -> None:
+        raw = {
+            "id": "ipv6_svc",
+            "name": "IPv6 Service",
+            "command": "python server.py",
+            "health_check": {
+                "type": "tcp",
+                "target": "[::1]:9000",
+            },
+        }
+        defn = registry._parse_definition(raw, Path("services/ipv6_svc.json"))
+        self.assertIsNotNone(defn)
+        assert defn is not None
+        self.assertIsNotNone(defn.health_check)
+        assert defn.health_check is not None
+        self.assertEqual(defn.health_check.type, "tcp")
+        self.assertEqual(defn.health_check.target, "[::1]:9000")
+
+    def test_rejection_of_invalid_bracketed_ipv6_tcp(self) -> None:
+        for bad_target in ["[::1]:abc", "[::1]", "[fe80::1]:9000", "[::1]:70000"]:
+            raw = {
+                "id": "bad_ipv6",
+                "name": "Bad IPv6",
+                "command": "python server.py",
+                "health_check": {
+                    "type": "tcp",
+                    "target": bad_target,
+                },
+            }
+            defn = registry._parse_definition(raw, Path("services/bad_ipv6.json"))
+            self.assertIsNone(defn, f"Target {bad_target} should have been rejected")
+
+    def test_discovery_resilience_with_malformed_health_check_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc_dir = Path(tmpdir)
+            file_bad = svc_dir / "01_bad.json"
+            file_bad.write_text(
+                json.dumps({
+                    "id": "bad_service",
+                    "name": "Bad Service",
+                    "command": "python broken.py",
+                    "health_check": {
+                        "type": "http",
+                        "target": "http://127.0.0.1:abc",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            file_good = svc_dir / "02_good.json"
+            file_good.write_text(
+                json.dumps({
+                    "id": "good_service",
+                    "name": "Good Service",
+                    "command": "python ok.py",
+                    "health_check": {
+                        "type": "http",
+                        "target": "http://127.0.0.1:8080/health",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            with patch.object(registry.config, "SERVICES_DIR", svc_dir):
+                discovered = registry.discover()
+                self.assertEqual(len(discovered), 1)
+                self.assertEqual(discovered[0].id, "good_service")
+
+
+# ===========================================================================
+# TestHealthEvaluatorHeartbeatFile
+# ===========================================================================
+class TestHealthEvaluatorHeartbeatFile(unittest.TestCase):
+    """Verify heartbeat file freshness and existence checks."""
+
+    def test_fresh_heartbeat_file_returns_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hb_file = Path(tmpdir) / "hb.txt"
+            hb_file.write_text("heartbeat", encoding="utf-8")
+            status, msg = health_evaluator.check_heartbeat_file(hb_file, max_age_seconds=10.0)
+            self.assertEqual(status, ServiceHealth.HEALTHY)
+            self.assertIn("fresh", msg)
+
+    def test_missing_heartbeat_file_returns_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hb_file = Path(tmpdir) / "nonexistent.txt"
+            status, msg = health_evaluator.check_heartbeat_file(hb_file, max_age_seconds=10.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("does not exist", msg)
+
+    def test_stale_heartbeat_file_returns_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hb_file = Path(tmpdir) / "hb.txt"
+            hb_file.write_text("heartbeat", encoding="utf-8")
+            old_time = time.time() - 100.0
+            os.utime(hb_file, (old_time, old_time))
+            status, msg = health_evaluator.check_heartbeat_file(hb_file, max_age_seconds=10.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("stale", msg)
+
+    def test_permission_error_returns_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hb_file = Path(tmpdir) / "hb.txt"
+            hb_file.write_text("heartbeat", encoding="utf-8")
+            with patch.object(Path, "stat", side_effect=PermissionError("denied")):
+                status, msg = health_evaluator.check_heartbeat_file(hb_file, max_age_seconds=10.0)
+                self.assertEqual(status, ServiceHealth.UNKNOWN)
+                self.assertIn("Permission denied", msg)
+
+
+# ===========================================================================
+# TestHealthEvaluatorHttp
+# ===========================================================================
+class TestHealthEvaluatorHttp(unittest.TestCase):
+    """Verify HTTP probe behavior with mocked network responses."""
+
+    def test_http_200_returns_healthy(self) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"OK"
+        with patch.object(health_evaluator._safe_opener, "open", return_value=mock_resp):
+            status, msg = health_evaluator.check_http_endpoint("http://127.0.0.1:8080/health", 2.0)
+            self.assertEqual(status, ServiceHealth.HEALTHY)
+            self.assertIn("HTTP 200", msg)
+
+    def test_http_500_error_returns_unhealthy(self) -> None:
+        import urllib.error
+        err = urllib.error.HTTPError("http://127.0.0.1:8080/health", 500, "Internal Server Error", {}, None)
+        with patch.object(health_evaluator._safe_opener, "open", side_effect=err):
+            status, msg = health_evaluator.check_http_endpoint("http://127.0.0.1:8080/health", 2.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("500", msg)
+
+    def test_http_timeout_returns_unhealthy(self) -> None:
+        import socket
+        with patch.object(health_evaluator._safe_opener, "open", side_effect=socket.timeout()):
+            status, msg = health_evaluator.check_http_endpoint("http://127.0.0.1:8080/health", 2.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("timed out", msg)
+
+    def test_http_connection_refused_returns_unhealthy(self) -> None:
+        import urllib.error
+        err = urllib.error.URLError(ConnectionRefusedError("refused"))
+        with patch.object(health_evaluator._safe_opener, "open", side_effect=err):
+            status, msg = health_evaluator.check_http_endpoint("http://127.0.0.1:8080/health", 2.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("failed", msg)
+
+    def test_non_loopback_url_rejected_as_unknown(self) -> None:
+        status, msg = health_evaluator.check_http_endpoint("http://example.com/health", 2.0)
+        self.assertEqual(status, ServiceHealth.UNKNOWN)
+        self.assertIn("non-loopback", msg)
+
+    def test_unsafe_redirect_handler_blocks_external_redirect(self) -> None:
+        import urllib.error
+        import urllib.request
+        handler = health_evaluator.SafeLoopbackRedirectHandler()
+        req = urllib.request.Request("http://127.0.0.1:8080/health")
+        with self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.com/pwn")
+
+    def test_check_http_endpoint_malformed_ports_returns_unknown(self) -> None:
+        """check_http_endpoint returns UNKNOWN without raising for malformed or out-of-range ports."""
+        for bad_url in [
+            "http://127.0.0.1:abc",
+            "http://localhost:invalid",
+            "http://127.0.0.1:70000",
+            "http://127.0.0.1:0",
+        ]:
+            status, msg = health_evaluator.check_http_endpoint(bad_url, 2.0)
+            self.assertEqual(status, ServiceHealth.UNKNOWN, f"URL {bad_url} should return UNKNOWN")
+            self.assertTrue(len(msg) > 0)
+
+
+# ===========================================================================
+# TestHealthEvaluatorTcp
+# ===========================================================================
+class TestHealthEvaluatorTcp(unittest.TestCase):
+    """Verify TCP probe behavior with mocked socket API."""
+
+    def test_tcp_success_returns_healthy(self) -> None:
+        mock_sock = MagicMock()
+        with patch("socket.create_connection", return_value=mock_sock):
+            status, msg = health_evaluator.check_tcp_port("127.0.0.1:9000", 2.0)
+            self.assertEqual(status, ServiceHealth.HEALTHY)
+            self.assertIn("succeeded", msg)
+            mock_sock.close.assert_called_once()
+
+    def test_tcp_connection_refused_returns_unhealthy(self) -> None:
+        with patch("socket.create_connection", side_effect=ConnectionRefusedError()):
+            status, msg = health_evaluator.check_tcp_port("127.0.0.1:9000", 2.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("refused", msg)
+
+    def test_tcp_timeout_returns_unhealthy(self) -> None:
+        import socket
+        with patch("socket.create_connection", side_effect=socket.timeout()):
+            status, msg = health_evaluator.check_tcp_port("127.0.0.1:9000", 2.0)
+            self.assertEqual(status, ServiceHealth.UNHEALTHY)
+            self.assertIn("timed out", msg)
+
+    def test_tcp_non_loopback_returns_unknown(self) -> None:
+        status, msg = health_evaluator.check_tcp_port("10.0.0.1:9000", 2.0)
+        self.assertEqual(status, ServiceHealth.UNKNOWN)
+        self.assertIn("non-loopback", msg)
+
+    def test_tcp_bracketed_ipv6_success(self) -> None:
+        """[::1]:port connects successfully to IPv6 loopback."""
+        mock_sock = MagicMock()
+        with patch("socket.create_connection", return_value=mock_sock) as mock_conn:
+            status, msg = health_evaluator.check_tcp_port("[::1]:9000", 2.0)
+            self.assertEqual(status, ServiceHealth.HEALTHY)
+            self.assertIn("succeeded", msg)
+            mock_conn.assert_called_once_with(("::1", 9000), timeout=2.0)
+            mock_sock.close.assert_called_once()
+
+    def test_tcp_bracketed_ipv6_malformed(self) -> None:
+        """Malformed or out-of-range bracketed IPv6 TCP targets return UNKNOWN."""
+        for bad_target in ["[::1]:abc", "[::1]", "[fe80::1]:9000", "[::1]:70000"]:
+            status, msg = health_evaluator.check_tcp_port(bad_target, 2.0)
+            self.assertEqual(status, ServiceHealth.UNKNOWN, f"Target {bad_target} should return UNKNOWN")
+
+
+# ===========================================================================
+# TestManagerHealthIntegration
+# ===========================================================================
+class TestManagerHealthIntegration(unittest.TestCase):
+    """Verify health evaluation integration into ServiceManager.get_status()."""
+
+    def setUp(self) -> None:
+        self.manager = manager_module.ServiceManager()
+        self.manager._runtime_state.clear()
+
+    def test_health_evaluated_when_identity_is_match(self) -> None:
+        defn = ServiceDefinition(
+            id="test_svc",
+            name="Test Service",
+            command=["python", "test.py"],
+            working_directory=Path("."),
+            health_check=HealthCheckConfig(type="tcp", target="127.0.0.1:8080"),
+        )
+        ident = ProcessIdentity(pid=1234, platform="nt" if runner._IS_WINDOWS else "posix", start_time=100)
+        self.manager._runtime_state[defn.id] = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+        )
+        with patch.object(runner, "verify_process_identity", return_value=IdentityVerificationResult.MATCH):
+            with patch.object(health_evaluator, "evaluate_health", return_value=(ServiceHealth.HEALTHY, "TCP OK")):
+                state = self.manager.get_status(defn)
+                self.assertEqual(state.health, ServiceHealth.HEALTHY)
+                self.assertEqual(state.health_message, "TCP OK")
+                self.assertIsNotNone(state.last_health_check_at)
+
+    def test_health_bypassed_when_identity_is_mismatch(self) -> None:
+        defn = ServiceDefinition(
+            id="test_svc",
+            name="Test Service",
+            command=["python", "test.py"],
+            working_directory=Path("."),
+            health_check=HealthCheckConfig(type="tcp", target="127.0.0.1:8080"),
+        )
+        ident = ProcessIdentity(pid=1234, platform="nt" if runner._IS_WINDOWS else "posix", start_time=100)
+        self.manager._runtime_state[defn.id] = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+        )
+        with patch.object(runner, "verify_process_identity", return_value=IdentityVerificationResult.MISMATCH):
+            with patch.object(health_evaluator, "evaluate_health") as mock_eval:
+                state = self.manager.get_status(defn)
+                mock_eval.assert_not_called()
+                self.assertEqual(state.status, ServiceStatus.FAILED)
+                self.assertEqual(state.health, ServiceHealth.NONE)
+
+    def test_health_bypassed_when_identity_is_exited(self) -> None:
+        defn = ServiceDefinition(
+            id="test_svc",
+            name="Test Service",
+            command=["python", "test.py"],
+            working_directory=Path("."),
+            health_check=HealthCheckConfig(type="tcp", target="127.0.0.1:8080"),
+        )
+        ident = ProcessIdentity(pid=1234, platform="nt" if runner._IS_WINDOWS else "posix", start_time=100)
+        self.manager._runtime_state[defn.id] = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+        )
+        with patch.object(runner, "verify_process_identity", return_value=IdentityVerificationResult.EXITED):
+            with patch.object(health_evaluator, "evaluate_health") as mock_eval:
+                state = self.manager.get_status(defn)
+                mock_eval.assert_not_called()
+                self.assertEqual(state.status, ServiceStatus.FAILED)
+                self.assertEqual(state.health, ServiceHealth.NONE)
+
+    def test_health_bypassed_when_identity_is_inconclusive(self) -> None:
+        defn = ServiceDefinition(
+            id="test_svc",
+            name="Test Service",
+            command=["python", "test.py"],
+            working_directory=Path("."),
+            health_check=HealthCheckConfig(type="tcp", target="127.0.0.1:8080"),
+        )
+        ident = ProcessIdentity(pid=1234, platform="nt" if runner._IS_WINDOWS else "posix", start_time=100)
+        self.manager._runtime_state[defn.id] = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+        )
+        with patch.object(runner, "verify_process_identity", return_value=IdentityVerificationResult.INCONCLUSIVE):
+            with patch.object(health_evaluator, "evaluate_health") as mock_eval:
+                state = self.manager.get_status(defn)
+                mock_eval.assert_not_called()
+                self.assertEqual(state.status, ServiceStatus.UNKNOWN)
+                self.assertEqual(state.health, ServiceHealth.UNKNOWN)
+
+    def test_unconfigured_health_check_reports_none(self) -> None:
+        defn = ServiceDefinition(
+            id="test_svc",
+            name="Test Service",
+            command=["python", "test.py"],
+            working_directory=Path("."),
+            health_check=None,
+        )
+        ident = ProcessIdentity(pid=1234, platform="nt" if runner._IS_WINDOWS else "posix", start_time=100)
+        self.manager._runtime_state[defn.id] = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+        )
+        with patch.object(runner, "verify_process_identity", return_value=IdentityVerificationResult.MATCH):
+            state = self.manager.get_status(defn)
+            self.assertEqual(state.health, ServiceHealth.NONE)
+            self.assertIsNone(state.health_message)
+
+    def test_health_probe_cache_avoids_duplicate_evaluation(self) -> None:
+        defn = ServiceDefinition(
+            id="test_svc",
+            name="Test Service",
+            command=["python", "test.py"],
+            working_directory=Path("."),
+            health_check=HealthCheckConfig(type="tcp", target="127.0.0.1:8080"),
+        )
+        ident = ProcessIdentity(pid=1234, platform="nt" if runner._IS_WINDOWS else "posix", start_time=100)
+        self.manager._runtime_state[defn.id] = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+        )
+        with patch.object(runner, "verify_process_identity", return_value=IdentityVerificationResult.MATCH):
+            with patch.object(health_evaluator, "evaluate_health", return_value=(ServiceHealth.HEALTHY, "OK")) as mock_eval:
+                self.manager.get_status(defn)
+                self.assertEqual(mock_eval.call_count, 1)
+
+                # Second immediate call uses cached result
+                self.manager.get_status(defn)
+                self.assertEqual(mock_eval.call_count, 1)
+
+                # Third call with force_probe=True re-evaluates
+                self.manager.get_status(defn, force_probe=True)
+                self.assertEqual(mock_eval.call_count, 2)
+
+
+# ===========================================================================
+# TestStartedAtAndHealthPersistence
+# ===========================================================================
+class TestStartedAtAndHealthPersistence(unittest.TestCase):
+    """Verify started_at and health state serialization and compatibility."""
+
+    def test_started_at_and_health_round_trip(self) -> None:
+        ident = ProcessIdentity(pid=1234, platform="posix", start_time=100, boot_id="boot-1")
+        now = datetime(2026, 10, 12, 12, 0, 0)
+        state = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            pid=1234,
+            identity=ident,
+            started_at=now,
+            health=ServiceHealth.HEALTHY,
+            health_message="All systems nominal",
+            last_health_check_at=now,
+        )
+        d = state.to_persisted_dict()
+        restored = ServiceRuntimeState.from_persisted_dict(d)
+        self.assertEqual(restored.started_at, now)
+        self.assertEqual(restored.health, ServiceHealth.HEALTHY)
+        self.assertEqual(restored.health_message, "All systems nominal")
+        self.assertEqual(restored.last_health_check_at, now)
+
+    def test_started_at_cleared_if_pid_or_identity_is_none(self) -> None:
+        d = {
+            "status": "STOPPED",
+            "pid": None,
+            "identity": None,
+            "started_at": "2026-10-12T12:00:00",
+            "health": "HEALTHY",
+        }
+        restored = ServiceRuntimeState.from_persisted_dict(d)
+        self.assertIsNone(restored.started_at)
+        self.assertEqual(restored.health, ServiceHealth.NONE)
+
+    def test_legacy_dict_without_health_and_started_at_loads_cleanly(self) -> None:
+        ident = {"pid": 1234, "platform": "posix", "start_time": 100, "boot_id": None}
+        d = {
+            "status": "RUNNING",
+            "pid": 1234,
+            "identity": ident,
+            "restart_count": 0,
+        }
+        restored = ServiceRuntimeState.from_persisted_dict(d)
+        self.assertIsNone(restored.started_at)
+        self.assertEqual(restored.health, ServiceHealth.NONE)
+        self.assertIsNone(restored.health_message)
+        self.assertIsNone(restored.last_health_check_at)
+
+    def test_runtime_seconds_calculates_when_started_at_present(self) -> None:
+        now = datetime.now()
+        state = ServiceRuntimeState(
+            status=ServiceStatus.RUNNING,
+            started_at=now,
+        )
+        self.assertIsNotNone(state.runtime_seconds())
+
+
+# ===========================================================================
+# TestGetLogTail
+# ===========================================================================
+class TestGetLogTail(unittest.TestCase):
+    """Verify get_log_tail bounded reading and error handling."""
+
+    def setUp(self) -> None:
+        self.manager = manager_module.ServiceManager()
+
+    def test_missing_log_file_returns_empty_list(self) -> None:
+        defn = ServiceDefinition(
+            id="nonexistent_svc",
+            name="Nonexistent",
+            command=["test"],
+            working_directory=Path("."),
+        )
+        lines = self.manager.get_log_tail(defn)
+        self.assertEqual(lines, [])
+
+    def test_reads_tail_lines_correctly(self) -> None:
+        defn = ServiceDefinition(
+            id="tail_svc",
+            name="Tail Svc",
+            command=["test"],
+            working_directory=Path("."),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir)
+            with patch.object(self.manager, "get_log_path", return_value=log_dir / "tail_svc.log"):
+                log_file = log_dir / "tail_svc.log"
+                log_file.write_text("line 1\nline 2\nline 3\nline 4\nline 5\n", encoding="utf-8")
+                lines = self.manager.get_log_tail(defn, max_lines=3)
+                self.assertEqual(lines, ["line 3", "line 4", "line 5"])
+
+    def test_bounded_bytes_read(self) -> None:
+        defn = ServiceDefinition(
+            id="big_log_svc",
+            name="Big Log",
+            command=["test"],
+            working_directory=Path("."),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir)
+            with patch.object(self.manager, "get_log_path", return_value=log_dir / "big.log"):
+                log_file = log_dir / "big.log"
+                content = "".join(f"line number {i:04d}\n" for i in range(1000))
+                log_file.write_text(content, encoding="utf-8")
+                lines = self.manager.get_log_tail(defn, max_lines=5, max_bytes=100)
+                self.assertEqual(len(lines), 5)
+                self.assertEqual(lines[-1], "line number 0999")
+
+
+# ===========================================================================
+# TestServicePageHealthDisplay
+# ===========================================================================
+class TestServicePageHealthDisplay(unittest.TestCase):
+    """Verify UI status formatting with health badges."""
+
+    def test_format_status_badge_with_health(self) -> None:
+        state_healthy = ServiceRuntimeState(status=ServiceStatus.RUNNING, health=ServiceHealth.HEALTHY)
+        self.assertEqual(services_page._format_status_badge(state_healthy), "RUNNING [HEALTHY]")
+
+        state_unhealthy = ServiceRuntimeState(status=ServiceStatus.RUNNING, health=ServiceHealth.UNHEALTHY)
+        self.assertEqual(services_page._format_status_badge(state_unhealthy), "RUNNING [UNHEALTHY]")
+
+        state_none = ServiceRuntimeState(status=ServiceStatus.RUNNING, health=ServiceHealth.NONE)
+        self.assertEqual(services_page._format_status_badge(state_none), "RUNNING")
+
+        state_stopped = ServiceRuntimeState(status=ServiceStatus.STOPPED, health=ServiceHealth.HEALTHY)
+        self.assertEqual(services_page._format_status_badge(state_stopped), "STOPPED")
 
 
 if __name__ == "__main__":

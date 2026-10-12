@@ -71,6 +71,32 @@ class ServiceStatus(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class ServiceHealth(str, Enum):
+    """Application health states for a managed service."""
+
+    HEALTHY = "HEALTHY"
+    UNHEALTHY = "UNHEALTHY"
+    UNKNOWN = "UNKNOWN"
+    NONE = "NONE"
+
+
+@dataclass(frozen=True)
+class HealthCheckConfig:
+    """Validated configuration for application-level health checks.
+
+    Attributes:
+        type: Probe type ("heartbeat_file", "http", or "tcp").
+        target: Target identifier (file path, loopback URL, or host:port).
+        timeout_seconds: Bounded timeout for network probes (seconds).
+        max_age_seconds: Bounded freshness threshold for file heartbeats (seconds).
+    """
+
+    type: str
+    target: str
+    timeout_seconds: float = 2.0
+    max_age_seconds: float = 30.0
+
+
 @dataclass(frozen=True)
 class ServiceDefinition:
     """A service's static configuration - what to run and how.
@@ -86,6 +112,7 @@ class ServiceDefinition:
         enabled: Whether this service should be offered for starting.
         auto_restart: Reserved for a future auto-restart supervisor;
             stored but not yet acted upon in v1.1.
+        health_check: Optional validated health check configuration.
     """
 
     id: str
@@ -95,6 +122,7 @@ class ServiceDefinition:
     environment: Dict[str, str] = field(default_factory=dict)
     enabled: bool = True
     auto_restart: bool = False
+    health_check: Optional[HealthCheckConfig] = None
 
 
 @dataclass
@@ -115,8 +143,14 @@ class ServiceRuntimeState:
             A non-None identity must be verified by runner.verify_process_identity()
             before any OS signal is sent.  A None identity disables
             signalling - the service must be started fresh.
-        started_at: When the process was last started, if known for
-            this session (not reconstructed across restarts).
+        started_at: When the process was started for the currently-running
+            verified process instance. Persisted across sessions and
+            restored only when process identity is verified.
+        health: Application-level health status (HEALTHY, UNHEALTHY,
+            UNKNOWN, or NONE if unconfigured).
+        health_message: Informative diagnosis message from the most recent
+            health check probe.
+        last_health_check_at: Timestamp of the most recent health probe.
         last_exit_code: Exit code from the most recent run, if known.
             Only ever populated when the OS actually gave us one (a
             process that died within its start grace period); left
@@ -142,6 +176,9 @@ class ServiceRuntimeState:
     pid: Optional[int] = None
     identity: Optional[ProcessIdentity] = None
     started_at: Optional[datetime] = None
+    health: ServiceHealth = ServiceHealth.NONE
+    health_message: Optional[str] = None
+    last_health_check_at: Optional[datetime] = None
     last_exit_code: Optional[int] = None
     last_error: Optional[str] = None
     last_exit_at: Optional[datetime] = None
@@ -163,9 +200,9 @@ class ServiceRuntimeState:
         """Serialize this state for the JSON runtime-state file.
 
         Datetimes are stored as ISO 8601 strings, since JSON has no
-        native datetime type. started_at is intentionally NOT
-        persisted - it reflects an in-memory session's start time and
-        is never meant to be reconstructed across a Citrus restart.
+        native datetime type. started_at is persisted so running service
+        uptime survives across Citrus restarts; it is only restored on
+        load if process identity is verified.
 
         identity is serialized as a nested dict when present so it
         survives a Citrus restart and can be re-verified next session.
@@ -188,6 +225,10 @@ class ServiceRuntimeState:
             "status": self.status.value,
             "pid": self.pid,
             "identity": identity_dict,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "health": self.health.value,
+            "health_message": self.health_message,
+            "last_health_check_at": self.last_health_check_at.isoformat() if self.last_health_check_at else None,
             "last_exit_code": self.last_exit_code,
             "last_error": self.last_error,
             "last_exit_at": self.last_exit_at.isoformat() if self.last_exit_at else None,
@@ -200,23 +241,23 @@ class ServiceRuntimeState:
         """Deserialize a persisted dict back into a ServiceRuntimeState.
 
         Backward compatible with state files written before
-        last_exit_at/last_stopped_at/restart_count/identity existed -
-        missing fields fall back to sensible defaults rather than
-        raising.  started_at is never restored from disk (see
-        to_persisted_dict).
+        last_exit_at/last_stopped_at/restart_count/identity/health/started_at
+        existed - missing fields fall back to sensible defaults rather than
+        raising.
 
-        Identity deserialisation notes
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Identity and started_at deserialisation notes
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         A missing or null ``"identity"`` key yields ``identity=None``,
         which is safe and backward-compatible.  A present identity dict
         with invalid field values (wrong types, negative start_time, etc.)
         or whose PID does not match the outer ``"pid"`` is treated the
         same as a missing identity: set to None and the state is still loaded.
         This ensures an inconsistent state cannot authorize process signalling.
-        This is deliberately more lenient than pid/status parsing because a damaged
-        identity baseline is recoverable (the service will be marked UNKNOWN and
-        re-started), whereas a bad status value indicates a fundamentally corrupt
-        entry.
+
+        ``started_at`` is restored only when both outer ``pid`` and ``identity``
+        are present, valid, and consistent. Otherwise it is cleared to None.
+        Likewise, ``health`` defaults to ``NONE`` if the service is not currently
+        associated with a valid running process.
 
         Args:
             entry: One service's raw dict, as loaded from the state
@@ -237,11 +278,33 @@ class ServiceRuntimeState:
         if pid is None or (identity is not None and identity.pid != pid):
             identity = None
 
+        started_at = _parse_optional_datetime(entry.get("started_at"))
+        if pid is None or identity is None:
+            started_at = None
+
+        health_raw = entry.get("health")
+        try:
+            health = ServiceHealth(health_raw) if isinstance(health_raw, str) else ServiceHealth.NONE
+        except ValueError:
+            health = ServiceHealth.NONE
+
+        health_message_raw = entry.get("health_message")
+        health_message = str(health_message_raw) if isinstance(health_message_raw, str) else None
+
+        last_health_check_at = _parse_optional_datetime(entry.get("last_health_check_at"))
+        if pid is None or identity is None:
+            health = ServiceHealth.NONE
+            health_message = None
+            last_health_check_at = None
+
         return cls(
             status=ServiceStatus(entry.get("status", ServiceStatus.UNKNOWN.value)),
             pid=pid,
             identity=identity,
-            started_at=None,
+            started_at=started_at,
+            health=health,
+            health_message=health_message,
+            last_health_check_at=last_health_check_at,
             last_exit_code=entry.get("last_exit_code"),
             last_error=entry.get("last_error"),
             last_exit_at=_parse_optional_datetime(entry.get("last_exit_at")),

@@ -14,13 +14,21 @@ from core import config
 from core.logging.events import EventNames, emit
 from core.logging.logger import get_logger
 from core.service_manager.manager import get_manager
-from core.service_manager.models import ServiceDefinition, ServiceRuntimeState
+from core.service_manager.models import ServiceDefinition, ServiceHealth, ServiceRuntimeState, ServiceStatus
 from core.ui import clear_screen, pause, print_divider, print_header, print_row
 
 logger = get_logger(__name__)
 
 _LOG_TAIL_LINES = 20
 _ServicePair = Tuple[ServiceDefinition, ServiceRuntimeState]
+
+
+def _format_status_badge(state: ServiceRuntimeState) -> str:
+    """Format the process lifecycle status with an optional health badge."""
+    status_str = state.status.value
+    if state.status == ServiceStatus.RUNNING and state.health != ServiceHealth.NONE:
+        return f"{status_str} [{state.health.value}]"
+    return status_str
 
 
 def _print_service_list(services: List[_ServicePair]) -> None:
@@ -32,7 +40,8 @@ def _print_service_list(services: List[_ServicePair]) -> None:
     print("\nConfigured Services")
     print_divider(config.MENU_WIDTH)
     for index, (definition, state) in enumerate(services, start=1):
-        print(f"{index}. {definition.name.ljust(24)} {state.status.value}")
+        status_display = _format_status_badge(state)
+        print(f"{index}. {definition.name.ljust(22)} {status_display}")
     print("\n0. Back")
 
 
@@ -66,6 +75,17 @@ def _print_service_detail(definition: ServiceDefinition, state: ServiceRuntimeSt
     print_header(definition.name, config.MENU_WIDTH)
     print()
     print_row("Status", state.status.value)
+    if state.status == ServiceStatus.RUNNING:
+        if state.health != ServiceHealth.NONE:
+            health_display = state.health.value
+            if state.health_message:
+                health_display = f"{health_display} ({state.health_message})"
+            print_row("Health", health_display)
+            if state.last_health_check_at:
+                print_row("Last Check", state.last_health_check_at.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            print_row("Health", "UNMONITORED")
+
     print_row("PID", str(state.pid) if state.pid is not None else "-")
     print_row("Started", state.started_at.strftime("%Y-%m-%d %H:%M:%S") if state.started_at else "-")
 
@@ -93,23 +113,17 @@ def _view_logs(definition: ServiceDefinition) -> None:
         definition: The service whose logs should be shown.
     """
     manager = get_manager()
-    log_path = manager.get_log_path(definition)
-
     clear_screen()
     print_header(f"{definition.name} - Logs", config.MENU_WIDTH)
 
-    if not log_path.is_file():
+    lines = manager.get_log_tail(definition, max_lines=_LOG_TAIL_LINES)
+    if not lines:
         print("\nNo logs yet.\n")
     else:
-        try:
-            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            print()
-            for line in lines[-_LOG_TAIL_LINES:]:
-                print(line)
-            print()
-        except OSError as exc:
-            logger.warning("Failed to read log file %s: %s", log_path, exc)
-            print("\nCould not read log file.\n")
+        print()
+        for line in lines:
+            print(line)
+        print()
 
     pause()
 
@@ -152,6 +166,7 @@ def _show_service_detail(definition: ServiceDefinition) -> None:
             result = manager.restart_service(definition)
             _report_result(result.message, result.error)
         elif choice == "4":
+            manager.get_status(definition, force_probe=True)
             continue
         elif choice == "5":
             _view_logs(definition)

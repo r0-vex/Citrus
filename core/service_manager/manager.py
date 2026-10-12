@@ -18,8 +18,14 @@ from typing import Dict, List, Optional, Tuple
 from core import config
 from core.logging.events import EventNames, emit
 from core.logging.logger import get_logger
-from core.service_manager import registry, runner
-from core.service_manager.models import ServiceDefinition, ServiceOperationResult, ServiceRuntimeState, ServiceStatus
+from core.service_manager import health as health_evaluator, registry, runner
+from core.service_manager.models import (
+    ServiceDefinition,
+    ServiceHealth,
+    ServiceOperationResult,
+    ServiceRuntimeState,
+    ServiceStatus,
+)
 from core.service_manager.runner import IdentityVerificationResult
 
 logger = get_logger(__name__)
@@ -132,7 +138,7 @@ class ServiceManager:
         """
         return [(definition, self.get_status(definition)) for definition in registry.discover()]
 
-    def get_status(self, definition: ServiceDefinition) -> ServiceRuntimeState:
+    def get_status(self, definition: ServiceDefinition, force_probe: bool = False) -> ServiceRuntimeState:
         """Return a service's current status, verified against the OS.
 
         Never trusts a stored PID at face value.  Uses
@@ -145,7 +151,7 @@ class ServiceManager:
           to UNKNOWN and clear the PID.  A legacy bare PID will NEVER be
           used to send any OS signal.
         - MATCH: process is alive and is our service; mark RUNNING if not
-          already.
+          already, and evaluate application health if configured.
         - EXITED: PID is gone; transition to FAILED with last_exit_at.
         - MISMATCH: PID was recycled; transition to FAILED, clear PID.
         - INCONCLUSIVE: check could not be completed; transition to UNKNOWN,
@@ -157,6 +163,8 @@ class ServiceManager:
 
         Args:
             definition: The service to check.
+            force_probe: If True, bypass the short probe cache TTL and evaluate
+                health checks immediately.
 
         Returns:
             The (possibly corrected) ServiceRuntimeState.
@@ -180,6 +188,10 @@ class ServiceManager:
                 status=ServiceStatus.UNKNOWN,
                 pid=None,
                 identity=None,
+                started_at=None,
+                health=ServiceHealth.NONE,
+                health_message=None,
+                last_health_check_at=None,
                 last_error="Legacy state: PID cleared (no process identity baseline). Restart the service.",
                 restart_count=state.restart_count,
                 last_stopped_at=state.last_stopped_at,
@@ -194,11 +206,43 @@ class ServiceManager:
         verification = runner.verify_process_identity(state.identity)
 
         if verification == IdentityVerificationResult.MATCH:
-            if state.status != ServiceStatus.RUNNING:
+            status_changed = state.status != ServiceStatus.RUNNING
+            if status_changed:
                 state.status = ServiceStatus.RUNNING
+
+            # Evaluate application health ONLY after verified MATCH
+            if definition.health_check is not None:
+                now = datetime.now()
+                should_probe = (
+                    force_probe
+                    or state.last_health_check_at is None
+                    or (now - state.last_health_check_at).total_seconds() > 2.0
+                )
+                if should_probe:
+                    health, health_message = health_evaluator.evaluate_health(definition)
+                    health_changed = (state.health != health or state.health_message != health_message)
+                    state.health = health
+                    state.health_message = health_message
+                    state.last_health_check_at = now
+                    if health_changed or status_changed:
+                        self._save_state()
+                    emit(
+                        EventNames.SERVICE_HEALTH_CHECKED,
+                        service_id=definition.id,
+                        health=state.health.value,
+                        message=state.health_message,
+                    )
+            else:
+                state.health = ServiceHealth.NONE
+                state.health_message = None
+
+            if status_changed:
                 self._runtime_state[definition.id] = state
                 self._save_state()
                 emit(EventNames.SERVICE_STATUS_CHECKED, service_id=definition.id, status=state.status.value)
+            else:
+                self._runtime_state[definition.id] = state
+
             return state
 
         if verification == IdentityVerificationResult.EXITED:
@@ -210,6 +254,10 @@ class ServiceManager:
                 status=ServiceStatus.FAILED,
                 pid=None,
                 identity=None,
+                started_at=None,
+                health=ServiceHealth.NONE,
+                health_message=None,
+                last_health_check_at=None,
                 last_exit_code=None,
                 last_error="Process exited unexpectedly (no longer running).",
                 last_exit_at=datetime.now(),
@@ -229,6 +277,10 @@ class ServiceManager:
                 status=ServiceStatus.FAILED,
                 pid=None,
                 identity=None,
+                started_at=None,
+                health=ServiceHealth.NONE,
+                health_message=None,
+                last_health_check_at=None,
                 last_exit_code=None,
                 last_error="PID recycled by a different process (identity mismatch).",
                 last_exit_at=datetime.now(),
@@ -249,6 +301,10 @@ class ServiceManager:
             status=ServiceStatus.UNKNOWN,
             pid=state.pid,
             identity=state.identity,  # Preserve for retry
+            started_at=state.started_at,
+            health=ServiceHealth.UNKNOWN,
+            health_message="Process identity verification inconclusive; health probe bypassed.",
+            last_health_check_at=state.last_health_check_at,
             last_error="Process identity verification inconclusive (permission denied or /proc read error).",
             restart_count=state.restart_count,
             last_stopped_at=state.last_stopped_at,
@@ -269,6 +325,44 @@ class ServiceManager:
             The absolute path to logs/services/<id>.log.
         """
         return config.SERVICE_LOG_DIR / f"{definition.id}.log"
+
+    def get_log_tail(
+        self,
+        definition: ServiceDefinition,
+        max_lines: int = 20,
+        max_bytes: int = 65536,
+    ) -> List[str]:
+        """Read the trailing lines of a service's log file with bounded memory usage.
+
+        Safely seeks to near the end of the file if it exceeds max_bytes to
+        avoid loading arbitrarily large files on memory-constrained devices.
+
+        Args:
+            definition: The service whose log tail to retrieve.
+            max_lines: Maximum number of trailing lines to return.
+            max_bytes: Maximum number of bytes to read from the end of the file.
+
+        Returns:
+            A list of string lines (without trailing newlines), or an empty list
+            if the log file is missing or unreadable.
+        """
+        log_path = self.get_log_path(definition)
+        if not log_path.is_file():
+            return []
+
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                read_size = min(size, max_bytes)
+                f.seek(size - read_size, os.SEEK_SET)
+                data = f.read(read_size)
+            text = data.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            return lines[-max_lines:] if max_lines > 0 else []
+        except OSError as exc:
+            logger.warning("Could not read log file %s: %s", log_path, exc)
+            return []
 
     # --- Operations --------------------------------------------------------
 

@@ -15,15 +15,17 @@ another *.json file in services/.
 """
 
 import json
+import math
 import re
 import shlex
+import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from core import config
 from core.logging.events import EventNames, emit
 from core.logging.logger import get_logger
-from core.service_manager.models import ServiceDefinition
+from core.service_manager.models import HealthCheckConfig, ServiceDefinition
 
 logger = get_logger(__name__)
 
@@ -130,6 +132,185 @@ def _parse_command(raw_command: object) -> Optional[List[str]]:
     return None
 
 
+_ALLOWED_HEALTH_CHECK_TYPES = ("heartbeat_file", "http", "tcp")
+_ALLOWED_HEALTH_CHECK_KEYS: Set[str] = {"type", "target", "timeout_seconds", "max_age_seconds"}
+_LOOPBACK_HOSTS: Set[str] = {"127.0.0.1", "localhost", "::1"}
+
+
+def _validate_numeric_bounded(
+    value: object,
+    field_name: str,
+    min_val: float,
+    max_val: float,
+    source: Path,
+) -> Optional[float]:
+    """Validate a numeric configuration parameter (not bool, finite, within bounds)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        logger.warning(
+            "Skipping %s: health_check '%s' must be a number, got %r",
+            source, field_name, value,
+        )
+        return None
+    val_float = float(value)
+    if not math.isfinite(val_float) or val_float < min_val or val_float > max_val:
+        logger.warning(
+            "Skipping %s: health_check '%s' must be between %s and %s, got %r",
+            source, field_name, min_val, max_val, value,
+        )
+        return None
+    return val_float
+
+
+def _parse_health_check(raw: dict, source: Path) -> Tuple[bool, Optional[HealthCheckConfig]]:
+    """Parse and validate optional health_check field.
+
+    Returns:
+        (True, None) if "health_check" is absent entirely (valid, unmonitored).
+        (True, HealthCheckConfig) if "health_check" is present and valid.
+        (False, None) if "health_check" is present but malformed/invalid (caller skips).
+    """
+    if "health_check" not in raw:
+        return True, None
+
+    hc_raw = raw["health_check"]
+    if not isinstance(hc_raw, dict):
+        logger.warning("Skipping %s: 'health_check' must be a JSON object, got %r", source, hc_raw)
+        return False, None
+
+    unexpected_keys = set(hc_raw.keys()) - _ALLOWED_HEALTH_CHECK_KEYS
+    if unexpected_keys:
+        logger.warning("Skipping %s: 'health_check' contains unrecognized keys %s", source, unexpected_keys)
+        return False, None
+
+    hc_type = hc_raw.get("type")
+    if not isinstance(hc_type, str) or hc_type not in _ALLOWED_HEALTH_CHECK_TYPES:
+        logger.warning(
+            "Skipping %s: 'health_check.type' must be one of %s, got %r",
+            source, _ALLOWED_HEALTH_CHECK_TYPES, hc_type,
+        )
+        return False, None
+
+    raw_target = hc_raw.get("target")
+    if not isinstance(raw_target, (str, int)) or isinstance(raw_target, bool):
+        logger.warning(
+            "Skipping %s: 'health_check.target' must be a non-empty string or port integer",
+            source,
+        )
+        return False, None
+
+    target_str = str(raw_target).strip()
+    if not target_str:
+        logger.warning("Skipping %s: 'health_check.target' must not be empty", source)
+        return False, None
+
+    # Validate target per type
+    if hc_type == "heartbeat_file":
+        p = Path(target_str)
+        if p.is_absolute() or ".." in p.parts:
+            logger.warning(
+                "Skipping %s: 'heartbeat_file' target must be a relative path without traversal, got %r",
+                source, target_str,
+            )
+            return False, None
+
+    elif hc_type == "http":
+        try:
+            parsed = urllib.parse.urlsplit(target_str)
+        except Exception as exc:
+            logger.warning("Skipping %s: invalid HTTP target URL %r: %s", source, target_str, exc)
+            return False, None
+
+        if parsed.scheme not in ("http", "https"):
+            logger.warning("Skipping %s: HTTP target scheme must be 'http' or 'https', got %r", source, parsed.scheme)
+            return False, None
+
+        if parsed.username or parsed.password or "@" in parsed.netloc:
+            logger.warning("Skipping %s: HTTP target must not contain credentials, got %r", source, target_str)
+            return False, None
+
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in _LOOPBACK_HOSTS:
+            logger.warning(
+                "Skipping %s: HTTP target host must be loopback (%s), got %r",
+                source, _LOOPBACK_HOSTS, hostname,
+            )
+            return False, None
+
+        try:
+            port = parsed.port
+        except ValueError:
+            logger.warning("Skipping %s: invalid HTTP port in target %r", source, target_str)
+            return False, None
+
+        if port is not None and not (1 <= port <= 65535):
+            logger.warning("Skipping %s: invalid HTTP port %r", source, port)
+            return False, None
+
+    elif hc_type == "tcp":
+        host = "127.0.0.1"
+        port_raw = ""
+        if target_str.startswith("["):
+            if "]:" not in target_str:
+                logger.warning(
+                    "Skipping %s: invalid bracketed IPv6 TCP target %r (missing ']:')",
+                    source,
+                    target_str,
+                )
+                return False, None
+            host_part, _, port_part = target_str[1:].partition("]:")
+            host = host_part.strip().lower()
+            port_raw = port_part.strip()
+        elif ":" in target_str:
+            parts = target_str.split(":", 1)
+            host = parts[0].strip().lower()
+            port_raw = parts[1].strip()
+        else:
+            port_raw = target_str.strip()
+
+        if host not in _LOOPBACK_HOSTS:
+            logger.warning(
+                "Skipping %s: TCP target host must be loopback (%s), got %r",
+                source,
+                _LOOPBACK_HOSTS,
+                host,
+            )
+            return False, None
+
+        try:
+            port_val = int(port_raw)
+        except ValueError:
+            logger.warning("Skipping %s: invalid TCP port in target %r", source, target_str)
+            return False, None
+
+        if not (1 <= port_val <= 65535):
+            logger.warning("Skipping %s: TCP port must be in range 1-65535, got %r", source, port_val)
+            return False, None
+        target_str = f"[{host}]:{port_val}" if ":" in host else f"{host}:{port_val}"
+
+    # timeout_seconds: default 2.0 (0.1s to 30.0s)
+    timeout = 2.0
+    if "timeout_seconds" in hc_raw:
+        parsed_timeout = _validate_numeric_bounded(hc_raw["timeout_seconds"], "timeout_seconds", 0.1, 30.0, source)
+        if parsed_timeout is None:
+            return False, None
+        timeout = parsed_timeout
+
+    # max_age_seconds: default 30.0 (0.5s to 3600.0s)
+    max_age = 30.0
+    if "max_age_seconds" in hc_raw:
+        parsed_max_age = _validate_numeric_bounded(hc_raw["max_age_seconds"], "max_age_seconds", 0.5, 3600.0, source)
+        if parsed_max_age is None:
+            return False, None
+        max_age = parsed_max_age
+
+    return True, HealthCheckConfig(
+        type=hc_type,
+        target=target_str,
+        timeout_seconds=timeout,
+        max_age_seconds=max_age,
+    )
+
+
 def _parse_definition(raw: dict, source: Path) -> Optional[ServiceDefinition]:
     """Parse and validate one service definition dict.
 
@@ -177,6 +358,15 @@ def _parse_definition(raw: dict, source: Path) -> Optional[ServiceDefinition]:
         return None
 
     try:
+        valid_hc, health_check = _parse_health_check(raw, source)
+    except Exception as exc:
+        logger.warning("Skipping %s: invalid health check configuration (%s)", source, exc)
+        return None
+
+    if not valid_hc:
+        return None
+
+    try:
         return ServiceDefinition(
             id=raw_id,
             name=str(raw["name"]),
@@ -185,6 +375,7 @@ def _parse_definition(raw: dict, source: Path) -> Optional[ServiceDefinition]:
             environment={str(key): str(value) for key, value in environment.items()},
             enabled=enabled,
             auto_restart=auto_restart,
+            health_check=health_check,
         )
     except (TypeError, ValueError) as exc:
         logger.warning("Skipping %s: %s", source, exc)
