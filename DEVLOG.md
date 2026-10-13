@@ -903,8 +903,8 @@ These were targeted validation checks, not a claim that a comprehensive automate
 - ✅ Pulled the commit onto Citrus-01
 - ✅ Confirmed the deployed commit matches `origin/main`
 - ✅ Updated this development log and README for the Day 5 milestone
-- ⬜ Commit the documentation update
-- ⬜ Create and push the `v1.2.0` release tag after documentation is committed
+- ✅ Committed the documentation update as `2f6bff3` (`Document Day 5 service manager hardening`)
+- ✅ Created and pushed the `v1.2.0` release tag and published GitHub release
 
 ### Day 5 Final Status
 
@@ -918,20 +918,127 @@ Windows Heartbeat Smoke Test   ✅ Passed
 Termux Heartbeat Smoke Test    ✅ Passed
 Targeted Persistence Checks    ✅ Passed
 GitHub Deployment              ✅ Complete
-Release Documentation          ✅ Drafts prepared
-Release Tag                    ⬜ Pending
+Release Documentation          ✅ Complete
+Release Tag                    ✅ v1.2.0 Complete
 ```
 
 ---
 
-## 🍋 Next Phase
+## 📅 Day 6 — Service Manager Reliability
 
-### Day 6 — Service Manager Edge-Case Testing
+### Reliability & Process Safety Hardening
 
-Recommended next focus:
+Day 6 hardened the Service Manager against process-identity hazards, PID recycling, and platform-specific termination defects. In multi-process environments and long-running Linux/Android servers, operating systems rapidly recycle process IDs after an exit. Storing a bare PID without verification risks signalling an unrelated application that later received the same PID.
 
-- ⬜ Verify unexpected process-exit handling
-- ⬜ Exercise malformed-state recovery against a disposable test state file
-- ⬜ Test restart behavior when stopping or starting fails
-- ⬜ Decide whether to build a repeatable automated regression suite
-- ⬜ Only then move into the next major feature
+Implemented:
+
+- **Process Identity Dataclass (`ProcessIdentity`):**
+  - OS-level fingerprint captured immediately upon service start.
+  - POSIX: records starttime clock ticks from `/proc/<pid>/stat` (field 22) and system boot UUID from `/proc/sys/kernel/random/boot_id`.
+  - Windows: records 64-bit FILETIME creation time via Win32 `GetProcessTimes`.
+- **Identity Verification Gate (`verify_process_identity`):**
+  - Returns explicit verification states: `MATCH`, `MISMATCH`, `EXITED`, or `INCONCLUSIVE`.
+  - Re-verifies process identity against the live OS before sending any termination signal.
+  - Refuses to signal or kill if verification returns `MISMATCH` or `INCONCLUSIVE`.
+- **Safe Process Termination:**
+  - POSIX: uses process group signalling (`killpg`) only when `pgid == pid`. Completely eliminates bare-PID signalling fallbacks. Re-verifies identity before any escalated `SIGKILL`.
+  - Windows: retains the process handle obtained from `OpenProcess` with explicit 64-bit pointer-sized handle declarations (`c_void_p`), terminates via `TerminateProcess` on the retained handle, and guarantees handle closure in a `finally: CloseHandle` block.
+- **Defensive State Recovery:**
+  - `ServiceRuntimeState.from_persisted_dict()` strictly validates PID and identity.
+  - Legacy state files lacking identity tokens or entries where outer PID does not match identity PID are defensively cleared to `identity=None`, disabling signalling until a fresh restart.
+- **Automated Regression Test Suite:**
+  - Built `tests/test_service_manager.py` with 97 initial unit tests.
+  - Tests mock all platform-specific APIs (Win32 ctypes, `/proc` filesystem reads) with zero live process execution, zero signal emissions, and zero state corruption.
+
+### Git & Commits
+- ✅ Implementation commit: `34f07ef` (`Harden service manager reliability`)
+- ✅ Full unit test pass: 97/97 tests passing
+
+### Deliberately Deferred
+- Auto-restart supervisor logic (configuration flag preserved, active supervisor deferred).
+- Background polling daemon.
+
+---
+
+## 📅 Day 7 — Service Health & Configuration
+
+### Application-Level Health Monitoring
+
+Day 7 introduced deterministic, standard-library-only application health evaluation, configuration validation, memory-safe log tailing, and session-surviving uptime tracking.
+
+Implemented:
+
+- **Health Models (`core/service_manager/models.py`):**
+  - Added `ServiceHealth` enum (`HEALTHY`, `UNHEALTHY`, `UNKNOWN`, `NONE`).
+  - Added immutable `HealthCheckConfig` dataclass (`type`, `target`, `timeout_seconds`, `max_age_seconds`).
+  - Extended `ServiceDefinition` with optional `health_check`.
+  - Persisted `started_at`, `health`, `health_message`, and `last_health_check_at` with backward compatibility for legacy state files.
+- **Passive Health Evaluators (`core/service_manager/health.py`):**
+  - `heartbeat_file`: verifies file existence and modification-time freshness via `os.stat` (0 bytes of file content read); directory traversal blocked.
+  - `http`: loopback HTTP GET request expecting 2xx/3xx; rejects credentials; bounded read (1024 bytes); bounded timeout; custom `SafeLoopbackRedirectHandler` enforces that redirects never leave loopback.
+  - `tcp`: loopback socket connection check (`socket.create_connection`); bounded timeout; properly closes sockets in `finally`.
+- **Configuration & Discovery Resilience (`core/service_manager/registry.py`):**
+  - Strict JSON schema validation for health-check configurations.
+  - Rejects unrecognized keys, non-loopback hosts, non-http schemes, and negative or non-finite timeouts (`math.isfinite`).
+  - **Independent Review Hardening:** Protected `parsed.port` property access against `ValueError` (e.g. `http://127.0.0.1:abc`, `http://localhost:invalid`, `http://127.0.0.1:70000`). Ensured a malformed service definition file never crashes `registry.discover()`.
+  - **IPv6 TCP Support:** Implemented unambiguous bracketed notation (`[::1]:<port>`) for TCP health checks while preserving strict loopback isolation.
+- **Service Manager Integration (`core/service_manager/manager.py`):**
+  - Health checks evaluate **strictly** when process identity returns `MATCH`.
+  - States `EXITED`, `MISMATCH`, and `INCONCLUSIVE` bypass health evaluation and preserve Day 6 safety invariants.
+  - `UNHEALTHY` results report diagnostic status and never automatically terminate services.
+  - Probe caching with 2.0-second TTL debounces rapid UI checks.
+  - Emits `SERVICE_HEALTH_CHECKED` event.
+  - Added `get_log_tail()`: reads trailing lines with bounded memory usage (seeks `size - min(size, 65536)` and slices 20 lines) to protect memory-constrained Termux devices.
+- **Services Interface (`core/pages/services.py`):**
+  - Formatted status badges (e.g. `RUNNING [HEALTHY]`, `RUNNING [UNHEALTHY]`, `RUNNING`).
+  - Detailed health diagnostics display on service detail screen.
+  - Option 4 ("Refresh") forces immediate health re-probing (`force_probe=True`).
+  - Integrated `get_log_tail()` for memory-safe log viewing.
+
+### Test & Verification Record
+- ✅ Added 49 new unit tests covering config validation, evaluators, redirect blocking, probe caching, log tails, malformed ports, and bracketed IPv6 TCP.
+- ✅ Full unit test suite: 146/146 tests passing (`python -m unittest discover -s tests -v`).
+- ✅ Warnings-as-errors validation: clean exit code 0 (`python -W error -m unittest discover -s tests`).
+- ✅ Bytecode compilation: clean exit code 0 (`python -m compileall -q core tests`).
+- ✅ Whitespace and Git formatting: clean exit code 0 (`git diff --check`).
+
+### Git & Deployment
+- ✅ Implementation commit: `5dad39f` (`Add service health checks and configuration validation`)
+- ⬜ Update version identity to `1.3.0` in `core/version.py`
+- ⬜ Update README and DEVLOG documentation
+- ⬜ Tag and publish `v1.3.0` release
+
+---
+
+## Day 6 & Day 7 Final Status
+
+```text
+Process Identity Verification (Day 6)  ✅ Complete
+PID Reuse Protection (Day 6)           ✅ Complete
+POSIX Process-Group Signals (Day 6)    ✅ Complete
+Windows Retained Handles (Day 6)       ✅ Complete
+Service Health Models (Day 7)          ✅ Complete
+Heartbeat/HTTP/TCP Evaluators (Day 7)  ✅ Complete
+Loopback & Redirect Safety (Day 7)     ✅ Complete
+Malformed Port Resilience (Day 7)      ✅ Complete
+IPv6 Loopback TCP Support (Day 7)      ✅ Complete
+Bounded Log Tailing (Day 7)            ✅ Complete
+Automated Unit Test Suite (146 tests)  ✅ 100% Passed
+Release Documentation                  ✅ Prepared
+Canonical Version (1.3.0)              ✅ Complete
+Release Tag (v1.3.0)                   ⬜ Pending
+```
+
+---
+
+## 🚀 Next Phase
+
+### Day 8 — Bot Manager & Automation Architecture
+
+Planned direction:
+
+⬜ Bot Manager module architecture
+⬜ Multi-process bot supervision
+⬜ Automatic restart supervisor with exponential backoff
+⬜ Automation engine and task scheduling
+⬜ Flask API & Web Dashboard foundation

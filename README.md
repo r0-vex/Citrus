@@ -1,6 +1,6 @@
 ![Python](https://img.shields.io/badge/Python-3.14-blue)
 
-![Version](https://img.shields.io/badge/version-v1.2.0-success)
+![Version](https://img.shields.io/badge/version-v1.3.0-success)
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -53,38 +53,35 @@ Current architecture includes:
 
 ### ⚙️ Service Manager
 
-Citrus includes a process-based Service Manager for running and controlling background services independently from the Citrus application.
+Citrus includes a process-based Service Manager for running, controlling, and diagnosing background services independently from the Citrus application.
 
 Current capabilities:
 
-- Service discovery
-- Service registry
-- Service definitions
-- Process spawning
-- PID tracking
-- Running-state detection
-- Start / Stop / Restart
-- Persistent service state
-- Per-service logging
-- Service lifecycle management
-- Process cleanup
-- Cross-platform process handling
-- Restart-count and lifecycle timestamp tracking
-- Atomic service-state persistence
-- Malformed persisted-state recovery
-- Strict service-definition validation
-- Failed-stop state recovery
+- Service discovery & JSON registry validation
+- Process identity verification & PID-reuse protection (`ProcessIdentity`)
+- OS-level process fingerprinting (POSIX `/proc/<pid>/stat` clock ticks & boot ID; Windows 64-bit FILETIME creation tokens)
+- Safe process termination (process group isolation on POSIX; retained pointer-sized handle termination on Windows)
+- Defensive runtime-state persistence (atomic writes, legacy bare-PID clearing, surviving restarts)
+- Application-level health monitoring (`heartbeat_file`, loopback HTTP, loopback TCP)
+- Loopback-only network probes (`127.0.0.1`, `localhost`, `[::1]`) with safe redirect filtering
+- Short probe caching (2.0s TTL) with on-demand manual refresh
+- Memory-bounded service-log tailing (`get_log_tail`)
+- Terminal UI health badges (`RUNNING [HEALTHY]`) and diagnostic detail views
+- Per-service logging under `logs/services/`
+- Lifecycle tracking (restart counts, started timestamps, last-exit codes, error details)
+
+*Note on current design:* Health checks report diagnostic health; automatic restart supervision remains reserved and deferred.
 
 Service architecture:
 
 ```text
-Service Registry
+Service Registry & Config
        │
        ▼
-Service Manager
+Service Manager ──────► Health Evaluator (Heartbeat / HTTP / TCP)
        │
        ▼
-Process Runner
+Process Runner (Identity Verification & Termination Safety)
        │
        ├── Start
        ├── Stop
@@ -274,28 +271,22 @@ The Samsung Galaxy J7 Max acts as the deployment and runtime server.
 
 Citrus is tested in both the development environment and the actual target server environment.
 
-Testing currently covers:
+The codebase includes an automated unit test suite with 146 tests running in sub-second time, using isolated mocks and temporary directories with zero real process-signalling or live external network side effects:
 
-- Core compilation
-- Application startup
-- Menu navigation
-- Dashboard
-- Logging
-- Event tracking
-- Service discovery
-- Service lifecycle
-- Process management
-- PID tracking
-- Service persistence
-- Cross-platform process handling
-- Restart-count and lifecycle timestamp tracking
-- Atomic service-state persistence
-- Malformed persisted-state recovery
-- Strict service-definition validation
-- Failed-stop state recovery
-- Termux compatibility
-
-The Service Manager has been specifically validated against the real Android / Termux environment.
+- Core compilation (`python -m compileall -q core tests`)
+- Application startup and session lifecycle
+- Menu navigation and dashboard rendering
+- Logging and event tracking
+- Service discovery and strict JSON definition validation
+- Process identity verification (POSIX `/proc/<pid>/stat` clock ticks & boot ID; Windows FILETIME)
+- Safe process termination (POSIX process groups; Windows 64-bit retained handles)
+- Signal refusal on unverified, mismatched, or inconclusive identities
+- Corrupt and legacy persisted state recovery
+- Application health checks (heartbeat file mtime freshness, loopback HTTP, loopback TCP)
+- HTTP/TCP URL and target parsing resilience against malformed ports
+- Safe redirect handling blocking non-loopback destinations
+- Bounded memory log tailing
+- Cross-platform compatibility (Windows and Android/Termux)
 
 ---
 
@@ -332,13 +323,15 @@ The development log records the evolution of Citrus from the initial Android ser
 - [x] Service-state persistence hardening
 - [x] Lifecycle metadata and restart tracking
 - [x] Service registry validation
-- [x] Windows and Termux heartbeat smoke tests
+- [x] Process identity verification & PID reuse protection (Day 6)
+- [x] Service Manager reliability hardening & 146 unit tests (Day 6)
+- [x] Service health monitoring & evaluators (Day 7)
+- [x] Loopback HTTP/TCP & heartbeat file health checks (Day 7)
+- [x] Bounded service log viewer (Day 7)
 
 ### Planned
 
-- [ ] Service health monitoring
-- [ ] Expanded service configuration
-- [ ] Advanced service metadata
+- [ ] Automatic service restart supervision
 - [ ] Bot Manager
 - [ ] Python bot deployment
 - [ ] Automation engine
@@ -375,11 +368,11 @@ Every new capability will be developed, tested, documented, and deployed increme
 
 ## 📌 Current Release
 
-**Citrus v1.2.0**
+**Citrus v1.3.0**
 
 Current milestone:
 
-> **Core v1.0 + Hardened Service Manager**
+> **Core v1.0 + Hardened Service Manager & Health Monitoring**
 
 ---
 

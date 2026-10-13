@@ -6,5 +6,5 @@ in the codebase should hardcode a version string - everything reads
 it from here.
 """
 
-VERSION: str = "1.2.0"
+VERSION: str = "1.3.0"
 VERSION_NAME: str = "Foundation"
