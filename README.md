@@ -93,6 +93,45 @@ The Service Manager has been tested on both **Windows** and the actual **Android
 
 ---
 
+### 🤖 Bot Manager
+
+Citrus provides a dedicated Bot Manager for controlling, supervising, and inspecting continuous Python bots (such as Telegram bots or background automation workers).
+
+Access the interactive Bots screen from Main Menu option **`3. Bots`**.
+
+Current capabilities:
+
+- **Manifest Discovery (`bots/*.json`):** Strict manifest parsing and validation, ignoring `.py` scripts and other files in `bots/`.
+- **Process Identity & PID Reuse Protection:** Reuses the verified `ProcessIdentity` engine to ensure recycled PIDs are never signaled.
+- **`UNKNOWN`-State Lifecycle Safety:** If identity verification is inconclusive (`UNKNOWN` with preserved PID), Citrus strictly blocks duplicate starts, refuses unverified stop signalling, and aborts restarts without modifying restart counters.
+- **Launch Identity Enforcement & Defensive Cleanup:** Bots require verified identity fingerprints upon launch. If identity capture fails, Citrus attempts termination and kill escalation via direct process handles. If process exit cannot be confirmed, the PID is truthfully preserved in an `UNKNOWN` state to prevent duplicate starts and bare-PID signalling without claiming unconfirmed termination.
+- **Protocol-Driven Execution:** Shared runner adheres to the decoupled `ProcessLaunchable` structural protocol without cross-module circular dependencies.
+- **Dedicated Runtime State Isolation:** Persists bot runtime state atomically to `temp/bot_manager_state.json`, completely isolated from `temp/service_manager_state.json`.
+- **Isolated Logging & Bounded Tail:** Directs stdout/stderr to `logs/bots/<bot_id>.log` with memory-bounded log-tail viewing.
+- **Lifecycle Controls:** Start, Stop, Restart, Refresh, and View Logs with clear diagnostic messaging.
+- **Structured Events:** Emits `BOT_DISCOVERED`, `BOT_START_REQUESTED`, `BOT_STARTED`, `BOT_START_FAILED`, `BOT_STOP_REQUESTED`, `BOT_STOPPED`, `BOT_STOP_FAILED`, `BOT_RESTART_REQUESTED`, `BOT_RESTARTED`, and `BOT_STATUS_CHECKED`.
+- **Credential Protection:** Bot tokens and environment variables are strictly redacted and never exposed in logs or terminal screens.
+
+*Manifest Format (`bots/<bot_id>.json`):*
+
+```json
+{
+  "id": "atlas",
+  "name": "Atlas Telegram Bot",
+  "command": ["python", "bots/atlas.py"],
+  "working_directory": ".",
+  "environment": {
+    "PYTHONUNBUFFERED": "1"
+  },
+  "enabled": true,
+  "auto_restart": false
+}
+```
+
+*Current limitations:* Status is verified on-demand against the live OS process table; automatic restart supervision and application-level bot health monitoring remain reserved and deferred to future milestones.
+
+---
+
 ## 📊 System Dashboard
 
 Citrus provides a terminal-based system dashboard displaying information such as:
@@ -133,6 +172,7 @@ logs/
 ├── errors.log
 ├── git.log
 ├── debug.log
+├── bots/
 └── services/
 ```
 
@@ -142,6 +182,7 @@ The logging system records:
 - Application start/stop events
 - Page navigation
 - Service activity
+- Bot activity
 - Git activity
 - Errors
 - Debug information
@@ -153,9 +194,11 @@ APP_STARTED
 APP_STOPPED
 PAGE_OPENED
 PAGE_CLOSED
+BOT_STARTED
+BOT_STOPPED
 ```
 
-Service logs are isolated under the `logs/services/` directory.
+Bot logs are isolated under `logs/bots/` and service logs under `logs/services/`.
 
 ---
 
@@ -197,8 +240,11 @@ Citrus/
 ├── web/
 ├── media/
 ├── logs/
+│   ├── bots/
+│   └── services/
 ├── configs/
 ├── core/
+│   ├── bot_manager/
 │   ├── service_manager/
 │   ├── system_info/
 │   ├── pages/
@@ -328,11 +374,16 @@ The development log records the evolution of Citrus from the initial Android ser
 - [x] Service health monitoring & evaluators (Day 7)
 - [x] Loopback HTTP/TCP & heartbeat file health checks (Day 7)
 - [x] Bounded service log viewer (Day 7)
+- [x] Bot Manager lifecycle controls & runtime status (Day 8)
+- [x] Process identity verification & PID reuse protection for bots (Day 8)
+- [x] Isolated bot runtime-state persistence & bounded logs (Day 8)
+- [x] Dedicated Bot Manager test suite & 200 passing unit tests (Day 8)
 
 ### Planned
 
 - [ ] Automatic service restart supervision
-- [ ] Bot Manager
+- [ ] Automatic bot restart supervision
+- [ ] Bot health monitoring
 - [ ] Python bot deployment
 - [ ] Automation engine
 - [ ] Flask API

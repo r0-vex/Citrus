@@ -48,7 +48,7 @@ import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from core import config
 from core.logging.logger import get_logger
@@ -61,6 +61,22 @@ from core.service_manager.models import (
 )
 
 logger = get_logger(__name__)
+
+
+@runtime_checkable
+class ProcessLaunchable(Protocol):
+    """Structural interface for any process definition startable by runner.start().
+
+    Both ServiceDefinition and BotDefinition satisfy this protocol without
+    creating any coupling between service_manager and bot_manager.
+    """
+
+    id: str
+    name: str
+    command: List[str]
+    working_directory: Path
+    environment: Dict[str, str]
+
 
 _STOP_POLL_INTERVAL_SECONDS: float = 0.2
 _DEFAULT_STOP_TIMEOUT_SECONDS: float = 5.0
@@ -686,24 +702,36 @@ def _validate_executable(command: List[str]) -> Optional[str]:
     return f"Executable not found: {executable}"
 
 
-def start(definition: ServiceDefinition) -> ServiceOperationResult:
-    """Start a service as a tracked, detached subprocess.
+def start(
+    definition: ProcessLaunchable,
+    log_path: Optional[Path] = None,
+    require_identity: bool = False,
+) -> ServiceOperationResult:
+    """Start a service or bot as a tracked, detached subprocess.
 
     The process is started in its own session (start_new_session=True)
     so it survives Citrus exiting or its controlling terminal closing
-    - services are meant to keep running independently of Citrus.
-    stdout/stderr are redirected to the service's own dedicated log
-    file; nothing from the child process ever reaches Citrus's own
-    logs.
+    - services and bots are meant to keep running independently of Citrus.
+    stdout/stderr are redirected to the dedicated log file; nothing from
+    the child process ever reaches Citrus's own logs.
 
     Args:
-        definition: The service to start.
+        definition: The service or bot definition to start. Must satisfy
+            the ProcessLaunchable protocol (`id`, `name`, `command`,
+            `working_directory`, and `environment`).
+        log_path: Optional custom path for the stdout/stderr log file. If
+            omitted, defaults to logs/services/<id>.log.
+        require_identity: If True, requires successful capture of the process
+            identity fingerprint. If capture fails and the process is still
+            running, Citrus immediately terminates the unmanaged child via its
+            Popen handle and fails the start operation.
 
     Returns:
         A ServiceOperationResult. On success, result.state holds the
         new RUNNING runtime state (with PID). On failure - including
-        a process that exits immediately - result.error explains why
-        and result.state (if present) reflects a FAILED state.
+        a process that exits immediately or whose required identity could
+        not be captured - result.error explains why and result.state
+        (if present) reflects a FAILED state.
     """
     validation_error = _validate_executable(definition.command)
     if validation_error:
@@ -715,8 +743,19 @@ def start(definition: ServiceDefinition) -> ServiceOperationResult:
         logger.warning("Refusing to start '%s': %s", definition.id, error)
         return ServiceOperationResult(success=False, message="Failed to start.", error=error)
 
-    config.ensure_service_runtime_directories()
-    log_path = config.SERVICE_LOG_DIR / f"{definition.id}.log"
+    if log_path is None:
+        config.ensure_service_runtime_directories()
+        target_log_path = config.SERVICE_LOG_DIR / f"{definition.id}.log"
+    else:
+        target_log_path = Path(log_path)
+        try:
+            target_log_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create log directory for '%s': %s", definition.id, exc)
+            return ServiceOperationResult(
+                success=False, message="Failed to start.", error=f"Could not create log directory: {exc}"
+            )
+
     merged_env = {**os.environ, **definition.environment}
 
     # POSIX: start_new_session (setsid) makes the child its own
@@ -733,7 +772,7 @@ def start(definition: ServiceDefinition) -> ServiceOperationResult:
         popen_kwargs = {"start_new_session": True}
 
     try:
-        log_file = open(log_path, "a", encoding="utf-8")
+        log_file = open(target_log_path, "a", encoding="utf-8")
     except OSError as exc:
         logger.warning("Could not open log file for '%s': %s", definition.id, exc)
         return ServiceOperationResult(success=False, message="Failed to start.", error=f"Could not open log file: {exc}")
@@ -777,7 +816,7 @@ def start(definition: ServiceDefinition) -> ServiceOperationResult:
     time.sleep(_START_GRACE_PERIOD_SECONDS)
     exit_code = process.poll()
     if exit_code is not None:
-        error = f"Process exited immediately with code {exit_code}. See {log_path}."
+        error = f"Process exited immediately with code {exit_code}. See {target_log_path}."
         logger.warning("Service '%s' failed to stay running: %s", definition.id, error)
         state = ServiceRuntimeState(
             status=ServiceStatus.FAILED,
@@ -789,6 +828,75 @@ def start(definition: ServiceDefinition) -> ServiceOperationResult:
             last_exit_at=datetime.now(),
         )
         return ServiceOperationResult(success=False, message="Failed to start.", error=error, state=state)
+
+    if require_identity and identity is None:
+        # Retry identity capture once after grace period if process is still running
+        identity = _capture_identity(process.pid)
+
+    if require_identity and identity is None:
+        logger.warning(
+            "Process identity capture failed for '%s' (PID %s) and require_identity=True; "
+            "attempting to terminate unmanaged process.",
+            definition.id,
+            process.pid,
+        )
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+                try:
+                    process.kill()
+                    try:
+                        process.wait(timeout=1.0)
+                    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+                        logger.warning("Process PID %s did not exit within timeout after kill.", process.pid)
+                except (OSError, subprocess.SubprocessError) as kill_exc:
+                    logger.warning("Error during process kill escalation for PID %s: %s", process.pid, kill_exc)
+        except (OSError, subprocess.SubprocessError) as term_exc:
+            logger.warning("Error while terminating unmanaged process PID %s: %s", process.pid, term_exc)
+
+        # Check whether the child process has actually exited
+        try:
+            exit_code = process.poll()
+        except (OSError, subprocess.SubprocessError) as poll_exc:
+            logger.warning("Error checking exit status of PID %s: %s", process.pid, poll_exc)
+            exit_code = None
+
+        if exit_code is not None:
+            error = (
+                f"Failed to capture process identity for PID {process.pid}; "
+                f"process terminated (exit code {exit_code})."
+            )
+            state = ServiceRuntimeState(
+                status=ServiceStatus.FAILED,
+                pid=None,
+                identity=None,
+                started_at=None,
+                last_exit_code=exit_code,
+                last_error=error,
+                last_exit_at=datetime.now(),
+            )
+            return ServiceOperationResult(success=False, message="Failed to start.", error=error, state=state)
+        else:
+            error = (
+                f"Failed to capture process identity for PID {process.pid}, and "
+                f"process termination could not be confirmed. Process may still be running unmanaged."
+            )
+            logger.error(
+                "Refusing to clear PID %s for '%s': unmanaged process could not be confirmed terminated.",
+                process.pid,
+                definition.id,
+            )
+            state = ServiceRuntimeState(
+                status=ServiceStatus.UNKNOWN,
+                pid=process.pid,
+                identity=None,
+                started_at=None,
+                last_exit_code=None,
+                last_error=error,
+            )
+            return ServiceOperationResult(success=False, message="Failed to start.", error=error, state=state)
 
     state = ServiceRuntimeState(
         status=ServiceStatus.RUNNING,

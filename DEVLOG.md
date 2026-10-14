@@ -1042,3 +1042,66 @@ Planned direction:
 ⬜ Automatic restart supervisor with exponential backoff
 ⬜ Automation engine and task scheduling
 ⬜ Flask API & Web Dashboard foundation
+
+---
+
+## 📅 Day 8 — Bot Manager: Lifecycle Controls & Runtime Status
+
+### 🎯 Objective
+Design and implement a dedicated Bot Manager subsystem (`core/bot_manager/`) providing discovery, lifecycle controls (start, stop, restart, refresh, log view), on-demand OS runtime status verification, process identity verification, isolated atomic state persistence, and credential protection without destabilizing the Service Manager or duplicating low-level OS process primitives.
+
+### 🧠 Architectural Decisions
+1. **Low-Level Runner Reuse:** Composed the proven `core.service_manager.runner` execution engine with a backward-compatible optional `log_path` parameter, ensuring bots output to `logs/bots/<id>.log` while inheriting all Win32 64-bit handle safety, POSIX process-group isolation (`setsid`), and `ProcessIdentity` creation-timestamp fingerprinting without duplicating 1,200+ lines of critical process-control logic.
+2. **Subsystem Isolation:** Created a dedicated `core/bot_manager/` package containing models, registry, and manager orchestrator. Bot runtime state is persisted exclusively to `temp/bot_manager_state.json` (separate from `temp/service_manager_state.json`), eliminating state collision risks.
+3. **Manifest Format (`bots/*.json`):** Discovers bot definitions exclusively from `bots/*.json` via `config.BOTS_DIR.glob("*.json")`, allowing bot source scripts (e.g. `bots/atlas.py`) to co-exist in `bots/` without triggering false parse attempts.
+4. **Process Identity & PID Reuse Safety:** Reused `runner.verify_process_identity()`:
+   - `MATCH`: process confirmed alive and matching start-time fingerprint; marks `RUNNING`.
+   - `EXITED`: process dead; marks `FAILED`, records exit timestamp.
+   - `MISMATCH`: PID recycled by an unrelated OS process; marks `FAILED`, clears PID immediately, strictly refuses to signal the recycled PID.
+   - `INCONCLUSIVE`: permission error or procfs read failure; marks `UNKNOWN`, preserves PID for diagnostic triage, strictly blocks all signals.
+   - Legacy states without identity tokens immediately clear PIDs and mark `UNKNOWN`.
+5. **Credential & Secret Protection:** Environment dictionaries and tokens are strictly protected; tokens are never logged to `events.log` or printed to terminal UI screens.
+6. **Interactive TUI Screen:** Replaced the `core/pages/bots.py` placeholder with a full terminal control screen providing configured bot lists, status badges, detailed runtime metrics, start/stop/restart/refresh actions, and bounded log tailing.
+7. **Explicit Deferred Scope:** Automatic restart supervision with backoff, background polling daemons, and application-level bot health probes remain deferred to future milestones.
+8. **`UNKNOWN` State Lifecycle Protection:** Closed the lifecycle vulnerability where an inconclusive verification status (`UNKNOWN` with preserved PID) could permit duplicate spawns or unsafe stop signalling. `start_bot()` strictly refuses launch if status is `UNKNOWN` with an active PID; `stop_bot()` refuses to report success or send bare-PID signals; `restart_bot()` aborts immediately if `stop_bot()` refuses. The unverified PID and identity remain preserved in runtime state for operator diagnosis.
+9. **`ProcessLaunchable` Structural Protocol:** Replaced `definition: Any` in `runner.start()` with `@runtime_checkable class ProcessLaunchable(Protocol)` requiring `id`, `name`, `command`, `working_directory`, and `environment`. Subsystems interact structurally without circular or upward dependencies.
+10. **Launch Identity Enforcement & Defensive Cleanup:** Added `require_identity: bool = False` to `runner.start()`. When enabled (by `BotManager`), if process identity fingerprint capture fails after launch and the child process is still running, Citrus attempts termination and kill escalation via its direct `Popen` handle. All expected cleanup exceptions (`TimeoutExpired`, `SubprocessError`, `OSError`) are handled defensively. If process exit is confirmed, status is marked `FAILED` with `pid=None`. If process exit cannot be confirmed (`exit_code is None`), Citrus avoids declaring false termination, marks status `UNKNOWN`, and preserves the active PID to block duplicate spawns and bare-PID signals.
+
+### 📁 Files Created & Modified
+- **Created:**
+  - `core/bot_manager/__init__.py`: Subsystem exports.
+  - `core/bot_manager/models.py`: `BotDefinition`, `BotRuntimeState`, `BotOperationResult`, `BotStatus`.
+  - `core/bot_manager/registry.py`: Manifest discovery and strict validation.
+  - `core/bot_manager/manager.py`: `BotManager` orchestrator, atomic persistence, lifecycle methods, and UNKNOWN-state safety guards.
+  - `tests/test_bot_manager.py`: 54 focused unit tests for models, registry, manager, identity checks, UNKNOWN guards, hardened launch-cleanup, and logs.
+- **Modified:**
+  - `core/config.py`: Added `BOTS_DIR`, `BOT_LOG_DIR`, `BOT_STATE_FILE`, `ensure_bot_runtime_directories()`.
+  - `core/logging/events.py`: Added missing `BOT_*` event names to `EventNames`.
+  - `core/service_manager/runner.py`: Added `ProcessLaunchable` protocol, hardened `require_identity` enforcement, and optional `log_path` in `start()`.
+  - `core/pages/bots.py`: Full interactive Bots screen.
+  - `README.md`: Documented Bot Manager capabilities, layout, manifest format, truthful cleanup claims, and feature checklist.
+  - `DEVLOG.md`: Day 8 implementation log and post-audit refinement notes.
+
+### 🧪 Verification
+- Unit test suite: 200 / 200 passing (`Ran 200 tests in 0.272s`, 0 failures, 0 errors).
+  - 146 existing Service Manager tests remain 100% passing without modification.
+  - 54 Bot Manager and runner refinement unit tests passing across all lifecycle transitions, UNKNOWN guards, and protocol edge cases.
+  - All tests executed in Windows development environment with mocked POSIX primitives; Android/Termux deployment validation to follow.
+- Compilation: `python -m compileall -q core tests` clean (0 warnings, 0 errors).
+- Warnings check: `python -W error -m unittest discover -s tests` passed with 0 errors.
+- Diff check: `git diff --check` clean.
+
+### 📊 Status Checkpoint
+```text
+Bot Manifest Discovery (bots/*.json)       ✅ Complete
+Process Identity & PID Reuse Safety        ✅ Complete
+UNKNOWN-State Lifecycle Protection         ✅ Complete
+ProcessLaunchable Structural Protocol      ✅ Complete
+Launch Identity Enforcement & Hardened     ✅ Complete
+Isolated Bot Runtime State Persistence     ✅ Complete
+Dedicated Bot Logging & Bounded Tail       ✅ Complete
+Lifecycle Controls (Start/Stop/Restart)    ✅ Complete
+Interactive TUI Page (Option 3)            ✅ Complete
+Automated Unit Test Suite (200 tests)      ✅ 100% Passed
+Documentation (README & DEVLOG)            ✅ Updated
+```

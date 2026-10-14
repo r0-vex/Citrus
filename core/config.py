@@ -35,6 +35,12 @@ SERVICES_DIR: Final[Path] = PROJECT_ROOT / "services"
 SERVICE_LOG_DIR: Final[Path] = LOG_DIR / "services"
 SERVICE_STATE_FILE: Final[Path] = PROJECT_ROOT / "temp" / "service_manager_state.json"
 
+# --- Bot Manager layout ----------------------------------------------------
+
+BOTS_DIR: Final[Path] = PROJECT_ROOT / "bots"
+BOT_LOG_DIR: Final[Path] = LOG_DIR / "bots"
+BOT_STATE_FILE: Final[Path] = PROJECT_ROOT / "temp" / "bot_manager_state.json"
+
 # --- Logging format --------------------------------------------------------
 
 LOG_FORMAT: Final[str] = "[%(asctime)s]\n%(levelname)s\n%(name)s\n%(message)s\n"
@@ -82,3 +88,21 @@ def ensure_service_runtime_directories() -> None:
         SERVICE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ConfigurationError(f"Could not create service runtime directories: {exc}") from exc
+
+
+def ensure_bot_runtime_directories() -> None:
+    """Create bot-manager runtime directories if they don't exist.
+
+    Covers the per-bot log directory (logs/bots/) and the
+    parent directory of the bot runtime-state file. Safe to call
+    multiple times.
+
+    Raises:
+        ConfigurationError: If a directory can't be created, e.g.
+            due to a permissions issue.
+    """
+    try:
+        BOT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        BOT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigurationError(f"Could not create bot runtime directories: {exc}") from exc

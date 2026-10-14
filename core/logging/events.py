@@ -45,8 +45,16 @@ class EventNames:
     SERVICE_HEALTH_CHECKED: Final[str] = "SERVICE_HEALTH_CHECKED"
     GIT_PULL: Final[str] = "GIT_PULL"
     GIT_PUSH: Final[str] = "GIT_PUSH"
+    BOT_DISCOVERED: Final[str] = "BOT_DISCOVERED"
+    BOT_START_REQUESTED: Final[str] = "BOT_START_REQUESTED"
     BOT_STARTED: Final[str] = "BOT_STARTED"
+    BOT_START_FAILED: Final[str] = "BOT_START_FAILED"
+    BOT_STOP_REQUESTED: Final[str] = "BOT_STOP_REQUESTED"
     BOT_STOPPED: Final[str] = "BOT_STOPPED"
+    BOT_STOP_FAILED: Final[str] = "BOT_STOP_FAILED"
+    BOT_RESTART_REQUESTED: Final[str] = "BOT_RESTART_REQUESTED"
+    BOT_RESTARTED: Final[str] = "BOT_RESTARTED"
+    BOT_STATUS_CHECKED: Final[str] = "BOT_STATUS_CHECKED"
 
 
 @dataclass(frozen=True)
